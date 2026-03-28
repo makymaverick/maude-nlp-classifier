@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  maude-classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maude-nlp-classifier
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENFDA_API_KEY=${OPENFDA_API_KEY:-}
+    volumes:
+      # Persist trained models and cached data across restarts
+      - ./models:/app/models
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Optional: Run training job as a one-off service
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maude-trainer
+    entrypoint: ["python", "-m", "src.model.train"]
+    command: ["--records", "5000", "--model", "logreg", "--drop-unknown"]
+    environment:
+      - OPENFDA_API_KEY=${OPENFDA_API_KEY:-}
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    profiles:
+      - train   # only run with: docker compose --profile train up train

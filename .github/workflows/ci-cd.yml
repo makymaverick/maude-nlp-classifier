@@ -1,0 +1,155 @@
+################################################################################
+# MAUDE NLP Classifier — GitHub Actions CI/CD Pipeline
+#
+# Triggers:
+#   - push to main  → run tests + build + deploy to ECS (prod)
+#   - pull_request  → run tests only
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,
+#   AWS_ACCOUNT_ID, OPENFDA_API_KEY (optional)
+################################################################################
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:      ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY:  maude-nlp-classifier
+  ECS_CLUSTER:     maude-nlp-classifier
+  ECS_SERVICE:     maude-nlp-classifier
+  CONTAINER_NAME:  maude-nlp-classifier
+  IMAGE_TAG:       ${{ github.sha }}
+
+jobs:
+  # ── Job 1: Lint & Test ──────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black isort
+
+      - name: Lint — flake8
+        run: flake8 src/ streamlit_app/ --max-line-length=100 --ignore=E501,W503
+
+      - name: Format check — black
+        run: black --check src/ streamlit_app/
+
+      - name: Import sort check — isort
+        run: isort --check-only src/ streamlit_app/
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=src --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Job 2: Build & Push Docker image ───────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create placeholder models dir (required by Dockerfile COPY)
+        run: mkdir -p models
+
+      - name: Build, tag & push Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          # Also tag as 'latest'
+          docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # ── Job 3: Deploy to ECS Fargate ───────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS Fargate
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $ECS_SERVICE \
+            --query taskDefinition \
+            > task-def-current.json
+
+      - name: Render updated task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition:  task-def-current.json
+          container-name:   ${{ env.CONTAINER_NAME }}
+          image:            ${{ needs.build.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:  ${{ steps.task-def.outputs.task-definition }}
+          service:          ${{ env.ECS_SERVICE }}
+          cluster:          ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployed ${{ env.IMAGE_TAG }} to ECS cluster ${{ env.ECS_CLUSTER }}"
