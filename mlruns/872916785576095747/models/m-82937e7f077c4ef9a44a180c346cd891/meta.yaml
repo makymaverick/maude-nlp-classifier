@@ -1,0 +1,10 @@
+artifact_location: /sessions/sleepy-laughing-galileo/mnt/Github Projects/maude-nlp-classifier/mlruns/872916785576095747/models/m-82937e7f077c4ef9a44a180c346cd891/artifacts
+creation_timestamp: 1774771245251
+experiment_id: '872916785576095747'
+last_updated_timestamp: 1774771262701
+model_id: m-82937e7f077c4ef9a44a180c346cd891
+model_type: null
+name: model
+source_run_id: bbd18cfe86a94f5294b914db31e5bafd
+status: 2
+status_message: null

@@ -14,8 +14,8 @@ streamlit>=1.34.0
 matplotlib>=3.8.0
 seaborn>=0.13.0
 
-# ─── MLflow — optional, for local experiment tracking (not needed on HF Spaces) ─
-# mlflow>=2.13.0
+# ─── MLflow — experiment tracking ────────────────────────────────────────────
+mlflow>=2.13.0
 
 # ─── Scheduler — CLI-only, not needed in Streamlit app ───────────────────────
 # apscheduler>=3.10.0
