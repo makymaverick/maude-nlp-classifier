@@ -28,6 +28,8 @@ from sklearn.metrics import (
     accuracy_score,
     f1_score,
 )
+from sklearn.dummy import DummyClassifier
+from sklearn.model_selection import cross_val_score
 from sklearn.utils.class_weight import compute_class_weight
 
 logger = logging.getLogger(__name__)
@@ -35,8 +37,8 @@ logger = logging.getLogger(__name__)
 LABEL_COL = "severity_label"
 TEXT_COL = "clean_text"
 
-# Labels ordered by severity (used for display)
-LABEL_ORDER = ["DEATH", "SERIOUS_INJURY", "INJURY", "MALFUNCTION", "UNKNOWN"]
+# Short label codes: D=Death, I=Injury, M=Malfunction, O=Other/Unknown
+LABEL_ORDER = ["D", "I", "M", "O", "UNKNOWN"]
 
 
 def build_pipeline(model_type: str = "logreg") -> Pipeline:
@@ -203,6 +205,74 @@ def predict_single(pipeline: Pipeline, text: str) -> dict:
         result["decision_scores"] = dict(zip(pipeline.classes_, scores.tolist()))
 
     return result
+
+
+def cross_validate_pipeline(
+    pipeline: Pipeline,
+    X: pd.Series,
+    y: pd.Series,
+    n_splits: int = 5,
+) -> dict:
+    """
+    Run StratifiedKFold cross-validation and return per-fold and mean scores.
+
+    This is the rigorous evaluation the adviser recommended: it gives a
+    realistic estimate of generalisation performance even on small datasets,
+    and catches inflated accuracy caused by lucky train/test splits.
+
+    Args:
+        pipeline: Untrained (or freshly built) sklearn Pipeline.
+        X: Full text series (before split).
+        y: Full label series.
+        n_splits: Number of CV folds (default 5).
+
+    Returns:
+        Dict with per-fold f1 scores, mean, and std.
+    """
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    scores = cross_val_score(
+        pipeline, X, y,
+        cv=cv,
+        scoring="f1_weighted",
+        n_jobs=-1,
+    )
+    result = {
+        "cv_f1_per_fold": scores.tolist(),
+        "cv_f1_mean": float(scores.mean()),
+        "cv_f1_std": float(scores.std()),
+        "n_splits": n_splits,
+    }
+    logger.info(
+        f"StratifiedKFold ({n_splits}-fold) F1: "
+        f"{scores.mean():.4f} ± {scores.std():.4f}"
+    )
+    return result
+
+
+def dummy_baseline(
+    X_train: pd.Series,
+    y_train: pd.Series,
+    X_test: pd.Series,
+    y_test: pd.Series,
+) -> dict:
+    """
+    Fit a most-frequent DummyClassifier and return its weighted F1.
+
+    Comparing against this baseline is a basic sanity check: if your model
+    barely beats a dummy classifier that always predicts the majority class,
+    the model has not actually learned anything useful from the text.
+
+    Returns:
+        Dict with dummy accuracy and f1_weighted.
+    """
+    dummy = DummyClassifier(strategy="most_frequent", random_state=42)
+    dummy.fit(X_train, y_train)
+    y_pred = dummy.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+    logger.info(f"Dummy baseline — Accuracy: {acc:.4f} | Weighted F1: {f1:.4f}")
+    return {"dummy_accuracy": acc, "dummy_f1_weighted": f1}
 
 
 def save_model(pipeline: Pipeline, path: str = "models/maude_classifier.joblib") -> None:

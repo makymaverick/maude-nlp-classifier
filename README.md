@@ -1,3 +1,15 @@
+---
+title: MAUDE NLP Severity Classifier
+emoji: 🏥
+colorFrom: blue
+colorTo: red
+sdk: streamlit
+sdk_version: 1.34.0
+app_file: streamlit_app/app.py
+pinned: false
+license: mit
+---
+
 # 🏥 MAUDE NLP Severity Classifier
 
 [![CI/CD Pipeline](https://github.com/makymaverick/maude-nlp-classifier/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/makymaverick/maude-nlp-classifier/actions)
