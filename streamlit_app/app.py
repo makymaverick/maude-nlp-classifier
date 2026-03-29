@@ -294,7 +294,7 @@ with tab_infer:
                     result["decision_scores"].items(), columns=["Code", "Score"]
                 ).sort_values("Score", ascending=False)
                 scores_df["Label"] = scores_df["Code"].map(LABEL_NAMES)
-                st.dataframe(scores_df, use_container_width=True)
+                st.dataframe(scores_df, hide_index=True)
 
 # ══════════════════════════════════════════════
 # TAB 3 — Data Explorer
@@ -336,7 +336,7 @@ with tab_explore:
         st.markdown(f"Showing **{len(filtered):,}** records")
         display_cols = ["report_number", "date_received", "severity_label", "device_name",
                          "clean_text" if "clean_text" in filtered.columns else "narrative_text"]
-        st.dataframe(filtered[display_cols], use_container_width=True, height=400)
+        st.dataframe(filtered[display_cols], height=400, hide_index=True)
 
         st.download_button(
             "⬇️ Download Filtered Records (CSV)",
@@ -415,29 +415,47 @@ with tab_pipeline:
             if runs:
                 run_rows = []
                 for r in runs:
+                    # CV F1 must stay a pure float column (None for missing runs).
+                    # Using a string sentinel like "—" creates a mixed-type column
+                    # that PyArrow cannot serialize to Arrow format.
+                    cv_raw = r.data.metrics.get("cv_f1_mean")
+                    cv_f1_val = round(cv_raw, 4) if cv_raw is not None else None
+
                     run_rows.append({
-                        "Run ID": r.info.run_id[:8],
-                        "Started": pd.to_datetime(r.info.start_time, unit="ms").strftime("%Y-%m-%d %H:%M"),
-                        "F1 (weighted)": round(r.data.metrics.get("f1_weighted", 0), 4),
-                        "Accuracy": round(r.data.metrics.get("accuracy", 0), 4),
-                        "CV F1": round(r.data.metrics.get("cv_f1_mean", 0), 4) or "—",
-                        "Dummy F1": round(r.data.metrics.get("dummy_f1_weighted", 0), 4),
-                        "Model": r.data.params.get("model_type", "—"),
-                        "Records": int(r.data.params.get("records_fetched", 0) or 0),
-                        "Promoted": r.data.tags.get("promoted", "—"),
+                        "Run ID":       r.info.run_id[:8],
+                        "Started":      pd.to_datetime(r.info.start_time, unit="ms").strftime("%Y-%m-%d %H:%M"),
+                        "F1 (hold-out)": round(r.data.metrics.get("f1_weighted", 0), 4),
+                        "CV F1 (mean)": cv_f1_val,
+                        "Accuracy":     round(r.data.metrics.get("accuracy", 0), 4),
+                        "Dummy F1":     round(r.data.metrics.get("dummy_f1_weighted", 0), 4),
+                        "Model":        r.data.params.get("model_type", ""),
+                        "Records":      int(r.data.params.get("records_fetched", 0) or 0),
+                        "Promoted":     r.data.tags.get("promoted", ""),
+                        "Reason":       r.data.tags.get("promotion_reason", ""),
                     })
                 runs_df = pd.DataFrame(run_rows)
-                st.dataframe(runs_df, use_container_width=True)
+                # "CV F1 (mean)" is float64 with possible NaN — fully Arrow-compatible
+                runs_df["CV F1 (mean)"] = runs_df["CV F1 (mean)"].astype("float64")
+                st.dataframe(runs_df, hide_index=True)
 
                 # F1 trend chart
                 st.markdown("**F1 Score Trend Across Runs**")
                 fig_trend, ax_trend = plt.subplots(figsize=(8, 3))
-                f1_vals = runs_df["F1 (weighted)"].tolist()[::-1]
-                ax_trend.plot(range(1, len(f1_vals) + 1), f1_vals,
-                              marker="o", color="#1f77b4", linewidth=2)
+                # Reverse so oldest run is run #1, newest is last
+                f1_vals    = runs_df["F1 (hold-out)"].tolist()[::-1]
+                cv_f1_vals = runs_df["CV F1 (mean)"].tolist()[::-1]
+                x = range(1, len(f1_vals) + 1)
+                ax_trend.plot(x, f1_vals, marker="o", color="#1f77b4",
+                              linewidth=2, label="Hold-out F1")
+                # Only plot CV F1 line where values are not NaN
+                cv_x = [i for i, v in zip(x, cv_f1_vals) if v == v]  # NaN != NaN
+                cv_y = [v for v in cv_f1_vals if v == v]
+                if cv_x:
+                    ax_trend.plot(cv_x, cv_y, marker="s", color="#2ca02c",
+                                  linewidth=2, linestyle="--", label="CV F1 (5-fold)")
                 ax_trend.axhline(
                     runs_df["Dummy F1"].iloc[0],
-                    linestyle="--", color="#d62728", alpha=0.6, label="Dummy baseline"
+                    linestyle=":", color="#d62728", alpha=0.7, label="Dummy baseline"
                 )
                 ax_trend.set_xlabel("Run #")
                 ax_trend.set_ylabel("Weighted F1")
