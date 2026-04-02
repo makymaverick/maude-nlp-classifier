@@ -61,7 +61,7 @@ def remove_boilerplate(text: str) -> str:
     return text
 
 
-def clean_text(text: str, lowercase: bool = True) -> str:
+def clean_text(text: str, lowercase: bool = True, preserve_digits: bool = False) -> str:
     """
     Full cleaning pipeline for a single narrative string.
 
@@ -69,13 +69,16 @@ def clean_text(text: str, lowercase: bool = True) -> str:
       1. Strip whitespace
       2. Remove boilerplate
       3. Expand abbreviations
-      4. Remove special characters and digits (keep letters + spaces)
+      4. Remove special characters (and optionally digits)
       5. Normalize whitespace
       6. Lowercase (optional)
 
     Args:
-        text: Raw narrative text string.
-        lowercase: Whether to convert to lowercase.
+        text:             Raw narrative text string.
+        lowercase:        Whether to convert to lowercase.
+        preserve_digits:  If True, keep digit tokens (required for BERT — device
+                          model numbers and dosages are meaningful to the encoder).
+                          If False (default, TF-IDF mode), digits are stripped.
 
     Returns:
         Cleaned text string.
@@ -87,8 +90,11 @@ def clean_text(text: str, lowercase: bool = True) -> str:
     text = remove_boilerplate(text)
     text = expand_abbreviations(text)
 
-    # Remove non-alphanumeric characters (keep spaces)
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    # Remove non-alphanumeric characters (keep spaces; optionally keep digits)
+    if preserve_digits:
+        text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    else:
+        text = re.sub(r"[^a-zA-Z\s]", " ", text)
 
     # Collapse multiple spaces
     text = re.sub(r"\s+", " ", text).strip()
@@ -103,21 +109,25 @@ def clean_dataframe(
     df: pd.DataFrame,
     text_col: str = "narrative_text",
     output_col: str = "clean_text",
+    preserve_digits: bool = False,
 ) -> pd.DataFrame:
     """
     Apply clean_text to an entire DataFrame column.
 
     Args:
-        df: Input DataFrame with raw narrative text.
-        text_col: Name of the column containing raw text.
-        output_col: Name of the new column to store cleaned text.
+        df:               Input DataFrame with raw narrative text.
+        text_col:         Name of the column containing raw text.
+        output_col:       Name of the new column to store cleaned text.
+        preserve_digits:  Passed through to clean_text; set True for BERT.
 
     Returns:
         DataFrame with a new cleaned text column, with empty-text rows dropped.
     """
     logger.info(f"Cleaning text in column '{text_col}'...")
     df = df.copy()
-    df[output_col] = df[text_col].apply(clean_text)
+    df[output_col] = df[text_col].apply(
+        lambda t: clean_text(t, preserve_digits=preserve_digits)
+    )
 
     # Drop rows where cleaning produced empty strings
     before = len(df)

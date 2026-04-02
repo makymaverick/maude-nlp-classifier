@@ -22,7 +22,35 @@ services:
       retries: 3
       start_period: 20s
 
-  # Optional: Run training job as a one-off service
+  # Phase 1 — ClinicalBERT app (CPU inference)
+  # docker compose --profile bert up maude-classifier-bert
+  maude-classifier-bert:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INCLUDE_BERT: "true"
+    container_name: maude-nlp-classifier-bert
+    ports:
+      - "8502:8501"
+    environment:
+      - OPENFDA_API_KEY=${OPENFDA_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - bert
+
+  # Optional: Run TF-IDF training as a one-off service
+  # docker compose --profile train up train
   train:
     build:
       context: .
@@ -36,4 +64,37 @@ services:
       - ./models:/app/models
       - ./data:/app/data
     profiles:
-      - train   # only run with: docker compose --profile train up train
+      - train
+
+  # Optional: Run ClinicalBERT fine-tuning as a one-off service (needs GPU host)
+  # docker compose --profile train-bert up train-bert
+  train-bert:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INCLUDE_BERT: "true"
+    container_name: maude-bert-trainer
+    entrypoint: ["python", "-m", "src.model.train_bert"]
+    command:
+      - "--records"
+      - "10000"
+      - "--epochs"
+      - "3"
+      - "--drop-unknown"
+    environment:
+      - OPENFDA_API_KEY=${OPENFDA_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    # Uncomment to enable GPU access (requires nvidia-container-toolkit on host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    profiles:
+      - train-bert

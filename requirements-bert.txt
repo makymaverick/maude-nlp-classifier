@@ -1,0 +1,16 @@
+# ─── Phase 1: ClinicalBERT dependencies ──────────────────────────────────────
+# Install ON TOP of requirements.txt:
+#   pip install -r requirements.txt -r requirements-bert.txt
+#
+# GPU training (recommended):
+#   pip install torch>=2.2.0 --index-url https://download.pytorch.org/whl/cu121
+#
+# CPU-only (HF Spaces / demo):
+#   pip install torch>=2.2.0 --index-url https://download.pytorch.org/whl/cpu
+# ─────────────────────────────────────────────────────────────────────────────
+
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.29.0
+huggingface_hub>=0.22.0
+onnxruntime>=1.18.0

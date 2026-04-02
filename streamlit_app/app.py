@@ -42,10 +42,24 @@ from src.model.classifier import (
     load_model,
 )
 
+# ClinicalBERT — imported lazily so the app loads even without torch installed
+_bert_available = False
+try:
+    from src.model.bert_classifier import (
+        predict_bert,
+        load_bert_from_ref,
+        BERT_MODEL_REF_PATH,
+    )
+    _bert_available = True
+except ImportError:
+    pass
+
 matplotlib.use("Agg")
 
 MODEL_PATH = "models/maude_classifier.joblib"
 CHAMPION_METRICS_PATH = "models/champion_metrics.json"
+BERT_MODEL_REF_PATH_LOCAL = "models/bert_model_ref.json"
+BERT_CHECKPOINT_DIR = "models/bert_checkpoint"
 
 # Short-code label colours
 SEVERITY_COLORS = {
@@ -65,6 +79,29 @@ LABEL_NAMES = {
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+@st.cache_resource(show_spinner="Loading ClinicalBERT model…")
+def _load_bert_cached():
+    """Load BERT checkpoint once per container lifecycle."""
+    if not _bert_available:
+        return None, None
+    try:
+        return load_bert_from_ref()
+    except Exception as e:
+        logger.warning(f"Could not load BERT checkpoint: {e}")
+        return None, None
+
+
+def _bert_checkpoint_exists() -> bool:
+    """True if a BERT checkpoint has been trained and the ref file is populated."""
+    if not _bert_available or not os.path.exists(BERT_MODEL_REF_PATH_LOCAL):
+        return False
+    with open(BERT_MODEL_REF_PATH_LOCAL) as f:
+        ref = json.load(f)
+    local_path = ref.get("local_path")
+    hub_repo = ref.get("hub_repo")
+    return bool((local_path and os.path.isdir(local_path)) or hub_repo)
 
 # ─────────────────────────────────────────────
 # Page config
@@ -101,16 +138,48 @@ with st.sidebar:
                           help="Recommended — gives realistic generalisation estimate.")
 
     st.divider()
+
+    # ── Model selector (Phase 1) ──────────────────────────────────────────
+    st.markdown("**Inference Model**")
+    _bert_ready = _bert_checkpoint_exists()
+    _inference_options = ["TF-IDF (baseline)"]
+    if _bert_available:
+        _bert_label = "ClinicalBERT" if _bert_ready else "ClinicalBERT (not trained yet)"
+        _inference_options.append(_bert_label)
+
+    inference_model = st.radio(
+        "Select model for Single Inference",
+        _inference_options,
+        index=0,
+        help=(
+            "TF-IDF: fast, ~4 MB, trains in seconds.\n"
+            "ClinicalBERT: +5–12 F1 pts, ~440 MB, requires GPU to fine-tune "
+            "(run train_bert.py first)."
+        ),
+    )
+    use_bert_inference = inference_model.startswith("ClinicalBERT") and _bert_ready
+
+    st.divider()
     st.markdown("**Model status**")
     if os.path.exists(MODEL_PATH):
-        st.success("✅ Trained model found")
+        st.success("✅ TF-IDF model found")
         if os.path.exists(CHAMPION_METRICS_PATH):
             with open(CHAMPION_METRICS_PATH) as f:
                 champ = json.load(f)
-            st.metric("Champion F1", f"{champ.get('f1_weighted', 0):.3f}")
+            champ_type = champ.get("model_type", "tfidf")
+            st.metric(
+                f"Champion F1 ({champ_type})",
+                f"{champ.get('f1_weighted') or champ.get('cv_f1_mean') or 0:.3f}",
+            )
             st.metric("Trained on", f"{champ.get('training_records', '?')} records")
     else:
-        st.warning("⚠️ No model yet — train below")
+        st.warning("⚠️ No TF-IDF model yet — train below")
+
+    if _bert_available:
+        if _bert_ready:
+            st.success("✅ ClinicalBERT checkpoint found")
+        else:
+            st.info("ℹ️ ClinicalBERT not trained yet\n`python -m src.model.train_bert`")
 
 # ─────────────────────────────────────────────
 # Tabs
@@ -251,12 +320,56 @@ with tab_infer:
         placeholder="Paste or type the MDR narrative here...",
     )
 
+    # Show which model will be used
+    if use_bert_inference:
+        st.info("Using **ClinicalBERT** for inference. First run may take ~30s to load the model.")
+    else:
+        st.info("Using **TF-IDF** baseline for inference.")
+
     if st.button("🔎 Classify", use_container_width=True):
         if not narrative_input.strip():
             st.warning("Please enter a narrative text.")
+        elif use_bert_inference:
+            # ── ClinicalBERT inference ────────────────────────────────────
+            bert_model, bert_tokenizer = _load_bert_cached()
+            if bert_model is None:
+                st.error("ClinicalBERT checkpoint could not be loaded. Check logs.")
+            else:
+                # Preserve digits for BERT
+                cleaned = clean_text(narrative_input, preserve_digits=True)
+                with st.spinner("Running ClinicalBERT inference…"):
+                    result = predict_bert(bert_model, bert_tokenizer, cleaned)
+
+                predicted = result["predicted_label"]
+                label_name = LABEL_NAMES.get(predicted, predicted)
+                color = SEVERITY_COLORS.get(predicted, "#333333")
+
+                st.markdown(
+                    f"<div style='background:{color};padding:16px;border-radius:8px;"
+                    f"color:white;font-size:22px;font-weight:bold;text-align:center'>"
+                    f"Predicted: {label_name} ({predicted}) — ClinicalBERT</div>",
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("**Class Probabilities**")
+                proba_df = pd.DataFrame(
+                    result["probabilities"].items(), columns=["Code", "Probability"]
+                ).sort_values("Probability", ascending=False)
+                proba_df["Label"] = proba_df["Code"].map(LABEL_NAMES)
+
+                fig3, ax3 = plt.subplots(figsize=(6, 3))
+                bar_colors = [SEVERITY_COLORS.get(c, "#aaa") for c in proba_df["Code"]]
+                ax3.barh(proba_df["Label"], proba_df["Probability"], color=bar_colors)
+                ax3.set_xlim(0, 1)
+                ax3.set_xlabel("Probability")
+                plt.tight_layout()
+                st.pyplot(fig3)
+                plt.close()
+
         elif not os.path.exists(MODEL_PATH):
-            st.error("No trained model found. Train the model first.")
+            st.error("No TF-IDF model found. Train the model first.")
         else:
+            # ── TF-IDF inference ──────────────────────────────────────────
             pipeline = load_model(MODEL_PATH)
             cleaned = clean_text(narrative_input)
             result = predict_single(pipeline, cleaned)
