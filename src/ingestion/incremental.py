@@ -110,7 +110,7 @@ def run_ingestion(
         api_key: openFDA API key. Falls back to OPENFDA_API_KEY env var.
         retrain: Whether to trigger a retrain after ingestion.
         cross_validate: Pass --cross-validate to train.py if retraining.
-        model_type: 'logreg' or 'svm'.
+        model_type: 'logreg', 'svm', or 'bert'.
 
     Returns:
         Summary dict with ingestion stats.
@@ -159,17 +159,30 @@ def run_ingestion(
 
 def _trigger_retrain(cross_validate: bool = False, model_type: str = "logreg") -> None:
     """
-    Invoke train.py as a subprocess so it runs in the same environment
-    and logs its own MLflow run cleanly.
+    Invoke the appropriate train script as a subprocess.
+
+    model_type="logreg" or "svm" → src.model.train (TF-IDF, CPU, fast)
+    model_type="bert"             → src.model.train_bert (ClinicalBERT, GPU recommended)
     """
-    cmd = [
-        sys.executable, "-m", "src.model.train",
-        "--use-cached",          # use the freshly saved accumulated CSV
-        "--drop-unknown",
-        "--model", model_type,
-    ]
-    if cross_validate:
-        cmd.append("--cross-validate")
+    if model_type == "bert":
+        cmd = [
+            sys.executable, "-m", "src.model.train_bert",
+            "--use-cached",
+            "--drop-unknown",
+            "--records", "0",   # ignored when --use-cached is set
+        ]
+        hub_repo = os.getenv("HF_HUB_REPO")
+        if hub_repo:
+            cmd += ["--hub-repo", hub_repo]
+    else:
+        cmd = [
+            sys.executable, "-m", "src.model.train",
+            "--use-cached",
+            "--drop-unknown",
+            "--model", model_type,
+        ]
+        if cross_validate:
+            cmd.append("--cross-validate")
 
     logger.info(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=False)
@@ -262,8 +275,8 @@ if __name__ == "__main__":  # pragma: no cover
         help="Records to fetch per ingestion run (default: 10,000)"
     )
     parser.add_argument(
-        "--model", type=str, default="logreg", choices=["logreg", "svm"],
-        help="Classifier type for retraining"
+        "--model", type=str, default="logreg", choices=["logreg", "svm", "bert"],
+        help="Classifier type for retraining (bert requires GPU and transformers)"
     )
     parser.add_argument(
         "--no-retrain", action="store_true",

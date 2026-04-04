@@ -1,0 +1,169 @@
+################################################################################
+# MAUDE NLP Classifier — Scheduled Data Ingestion + Retrain
+#
+# Triggers:
+#   - Cron: daily at 02:00 UTC (configurable)
+#   - Manual: workflow_dispatch for on-demand runs
+#
+# What it does:
+#   1. Fetches a configurable batch of MAUDE records from openFDA
+#   2. Deduplicates against the accumulated dataset stored in S3
+#   3. Syncs the updated accumulated CSV back to S3
+#   4. Triggers a TF-IDF retrain (fast, CPU) with MLflow logging
+#   5. Uploads the updated MLflow run db and champion_metrics.json to S3
+#   6. On Sundays: also dispatches the BERT fine-tuning workflow for deep retraining
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ACCOUNT_ID
+#   OPENFDA_API_KEY   — openFDA API key (optional)
+#   GH_PAT            — GitHub PAT with workflow scope (for dispatching bert-train.yml)
+#
+# Required AWS Resources:
+#   S3 bucket:  maude-nlp-checkpoints-<account_id>
+################################################################################
+
+name: Scheduled Data Ingestion & Retrain
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # daily at 02:00 UTC
+
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Records to fetch from openFDA"
+        required: false
+        default: "10000"
+      model_type:
+        description: "Classifier to retrain (logreg or svm)"
+        required: false
+        default: "logreg"
+      cross_validate:
+        description: "Run cross-validation during retrain (true/false)"
+        required: false
+        default: "false"
+      trigger_bert:
+        description: "Also dispatch ClinicalBERT fine-tuning after ingestion"
+        required: false
+        default: "false"
+
+env:
+  AWS_REGION:     ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  S3_BUCKET:      maude-nlp-checkpoints-${{ secrets.AWS_ACCOUNT_ID }}
+  S3_DATA_PREFIX: accumulated-data
+  S3_MLFLOW_PREFIX: mlruns
+
+jobs:
+  ingest-and-retrain:
+    name: Ingest MAUDE Data & Retrain Classifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Restore accumulated dataset from S3
+        run: |
+          mkdir -p data/accumulated data/raw models mlruns
+          # Download accumulated CSV if it exists in S3 (soft-fail if first run)
+          aws s3 cp s3://$S3_BUCKET/$S3_DATA_PREFIX/maude_accumulated.csv \
+              data/accumulated/maude_accumulated.csv 2>/dev/null || true
+          # Restore champion metrics
+          aws s3 cp s3://$S3_BUCKET/models/champion_metrics.json \
+              models/champion_metrics.json 2>/dev/null || true
+          aws s3 cp s3://$S3_BUCKET/models/maude_classifier.joblib \
+              models/maude_classifier.joblib 2>/dev/null || true
+          # Restore MLflow tracking db
+          aws s3 sync s3://$S3_BUCKET/$S3_MLFLOW_PREFIX/ mlruns/ 2>/dev/null || true
+
+          ROWS=$(wc -l < data/accumulated/maude_accumulated.csv 2>/dev/null || echo 0)
+          echo "Restored accumulated dataset: ${ROWS} rows"
+
+      - name: Run incremental ingestion + retrain
+        env:
+          OPENFDA_API_KEY:  ${{ secrets.OPENFDA_API_KEY }}
+          MLFLOW_TRACKING_URI: mlruns
+          BATCH_SIZE:       ${{ github.event.inputs.batch_size || '10000' }}
+          MODEL_TYPE:       ${{ github.event.inputs.model_type || 'logreg' }}
+          CROSS_VALIDATE:   ${{ github.event.inputs.cross_validate || 'false' }}
+        run: |
+          CV_FLAG=""
+          if [ "$CROSS_VALIDATE" = "true" ]; then
+            CV_FLAG="--cross-validate"
+          fi
+          python -m src.ingestion.incremental \
+            --batch $BATCH_SIZE \
+            --model $MODEL_TYPE \
+            $CV_FLAG
+
+      - name: Persist updated artifacts to S3
+        run: |
+          # Accumulated dataset
+          aws s3 cp data/accumulated/maude_accumulated.csv \
+              s3://$S3_BUCKET/$S3_DATA_PREFIX/maude_accumulated.csv
+
+          # Champion model + metrics
+          [ -f models/maude_classifier.joblib ] && \
+            aws s3 cp models/maude_classifier.joblib \
+                s3://$S3_BUCKET/models/maude_classifier.joblib
+          [ -f models/champion_metrics.json ] && \
+            aws s3 cp models/champion_metrics.json \
+                s3://$S3_BUCKET/models/champion_metrics.json
+
+          # MLflow experiment tracking
+          aws s3 sync mlruns/ s3://$S3_BUCKET/$S3_MLFLOW_PREFIX/ \
+            --exclude "*.tmp" --delete
+
+          echo "Artifacts synced to s3://$S3_BUCKET"
+
+      - name: Report ingestion summary
+        run: |
+          if [ -f models/champion_metrics.json ]; then
+            echo "=== Champion Model Metrics ==="
+            cat models/champion_metrics.json
+          fi
+
+      # ── Trigger BERT fine-tuning on Sundays or when explicitly requested ──
+      - name: Dispatch ClinicalBERT fine-tuning workflow
+        if: |
+          github.event.inputs.trigger_bert == 'true' ||
+          (github.event_name == 'schedule' && startsWith(github.run_id, '') &&
+           format('{0}', toJSON(github.event.schedule)) == '"0 2 * * 0"')
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              workflow_id: 'bert-train.yml',
+              ref: 'main',
+              inputs: {
+                records:    '20000',
+                epochs:     '3',
+                lr:         '2e-5',
+                batch_size: '16',
+                hub_repo:   'mukundisb/maude-clinicalbert',
+              },
+            });
+            console.log('Dispatched bert-train.yml for weekly deep retraining.');

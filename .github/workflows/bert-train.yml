@@ -1,0 +1,226 @@
+################################################################################
+# MAUDE NLP Classifier — ClinicalBERT Fine-tuning via AWS SageMaker
+#
+# Trigger:
+#   - Manual (workflow_dispatch) with configurable hyperparameters
+#   - Automatic on push to main when src/model/bert_classifier.py changes
+#
+# What it does:
+#   1. Packages the training script into a SageMaker-compatible container
+#   2. Submits a SageMaker Training Job on a ml.g4dn.xlarge GPU instance
+#   3. Uploads the fine-tuned checkpoint to S3
+#   4. Optionally pushes the checkpoint to HuggingFace Hub (mukundisb/maude-clinicalbert)
+#   5. Updates models/bert_model_ref.json in the repo with the new checkpoint SHA
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ACCOUNT_ID
+#   HF_TOKEN             — HuggingFace write token for Hub push
+#   OPENFDA_API_KEY      — openFDA API key (optional)
+#
+# Required AWS Resources (created by Terraform):
+#   S3 bucket:           maude-nlp-checkpoints-<account_id>
+#   IAM role:            maude-nlp-classifier-sagemaker-role
+################################################################################
+
+name: ClinicalBERT Fine-Tuning (SageMaker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      records:
+        description: "MAUDE records to fetch for training"
+        required: false
+        default: "10000"
+      epochs:
+        description: "Fine-tuning epochs"
+        required: false
+        default: "3"
+      lr:
+        description: "AdamW learning rate"
+        required: false
+        default: "2e-5"
+      batch_size:
+        description: "Per-device batch size"
+        required: false
+        default: "16"
+      hub_repo:
+        description: "HuggingFace Hub repo (e.g. mukundisb/maude-clinicalbert)"
+        required: false
+        default: "mukundisb/maude-clinicalbert"
+      instance_type:
+        description: "SageMaker instance type"
+        required: false
+        default: "ml.g4dn.xlarge"
+
+  push:
+    branches: [main]
+    paths:
+      - "src/model/bert_classifier.py"
+      - "src/model/train_bert.py"
+
+env:
+  AWS_REGION:       ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID:   ${{ secrets.AWS_ACCOUNT_ID }}
+  S3_BUCKET:        maude-nlp-checkpoints-${{ secrets.AWS_ACCOUNT_ID }}
+  SAGEMAKER_ROLE:   arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/maude-nlp-classifier-sagemaker-role
+  ECR_REPOSITORY:   maude-nlp-classifier-training
+  IMAGE_TAG:        ${{ github.sha }}
+
+jobs:
+  # ── Job 1: Build training container and push to ECR ──────────────────────
+  build-training-image:
+    name: Build SageMaker Training Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repo if not exists
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null \
+            || aws ecr create-repository --repository-name $ECR_REPOSITORY \
+               --image-scanning-configuration scanOnPush=true
+
+      - name: Build and push GPU training image
+        id: push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build \
+            --build-arg INCLUDE_BERT=true \
+            --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu121 \
+            -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # ── Job 2: Submit SageMaker Training Job ─────────────────────────────────
+  train:
+    name: Fine-tune ClinicalBERT on SageMaker
+    runs-on: ubuntu-latest
+    needs: build-training-image
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install SageMaker SDK
+        run: pip install sagemaker boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Submit SageMaker Training Job
+        id: sm-train
+        env:
+          HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+          OPENFDA_API_KEY:   ${{ secrets.OPENFDA_API_KEY }}
+          RECORDS:           ${{ github.event.inputs.records || '10000' }}
+          EPOCHS:            ${{ github.event.inputs.epochs || '3' }}
+          LR:                ${{ github.event.inputs.lr || '2e-5' }}
+          BATCH_SIZE:        ${{ github.event.inputs.batch_size || '16' }}
+          HUB_REPO:          ${{ github.event.inputs.hub_repo || 'mukundisb/maude-clinicalbert' }}
+          INSTANCE_TYPE:     ${{ github.event.inputs.instance_type || 'ml.g4dn.xlarge' }}
+          IMAGE_URI:         ${{ needs.build-training-image.outputs.image_uri }}
+        run: |
+          python - <<'EOF'
+          import boto3, sagemaker, json, os
+          from sagemaker.estimator import Estimator
+          from datetime import datetime
+
+          sess = sagemaker.Session()
+          job_name = f"maude-bert-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+
+          estimator = Estimator(
+              image_uri=os.environ["IMAGE_URI"],
+              role=os.environ["SAGEMAKER_ROLE"],
+              instance_count=1,
+              instance_type=os.environ["INSTANCE_TYPE"],
+              volume_size=50,
+              max_run=7200,
+              output_path=f"s3://{os.environ['S3_BUCKET']}/checkpoints/",
+              base_job_name="maude-bert",
+              environment={
+                  "HF_TOKEN":        os.environ.get("HF_TOKEN", ""),
+                  "OPENFDA_API_KEY":  os.environ.get("OPENFDA_API_KEY", ""),
+              },
+              hyperparameters={
+                  "records":    os.environ["RECORDS"],
+                  "epochs":     os.environ["EPOCHS"],
+                  "lr":         os.environ["LR"],
+                  "batch-size": os.environ["BATCH_SIZE"],
+                  "hub-repo":   os.environ["HUB_REPO"],
+                  "drop-unknown": "",
+              },
+              entry_point="src/model/train_bert.py",
+              source_dir=".",
+          )
+
+          estimator.fit(wait=True, job_name=job_name)
+
+          # Write job name for downstream steps
+          with open("sagemaker_job.txt", "w") as f:
+              f.write(job_name)
+          print(f"SageMaker training job complete: {job_name}")
+          EOF
+
+      - name: Download checkpoint from S3 and update bert_model_ref.json
+        env:
+          HUB_REPO: ${{ github.event.inputs.hub_repo || 'mukundisb/maude-clinicalbert' }}
+        run: |
+          python - <<'EOF'
+          import boto3, json, os
+
+          hub_repo = os.environ.get("HUB_REPO", "mukundisb/maude-clinicalbert")
+          s3_bucket = os.environ["S3_BUCKET"]
+
+          # Write/update bert_model_ref.json pointer
+          ref = {
+              "hub_repo":    hub_repo,
+              "hub_sha":     None,   # will be set after HF push
+              "local_path":  None,
+              "s3_bucket":   s3_bucket,
+              "s3_prefix":   "checkpoints/",
+              "label_order": ["D", "I", "M", "O", "UNKNOWN"],
+              "_note": "Updated by bert-train.yml after SageMaker training job."
+          }
+          os.makedirs("models", exist_ok=True)
+          with open("models/bert_model_ref.json", "w") as f:
+              json.dump(ref, f, indent=2)
+          print("Updated models/bert_model_ref.json")
+          EOF
+
+      - name: Commit updated bert_model_ref.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/bert_model_ref.json
+          git diff --cached --quiet || git commit -m "chore: update bert_model_ref.json after SageMaker training [skip ci]"
+          git push

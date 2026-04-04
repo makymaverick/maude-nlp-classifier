@@ -28,3 +28,16 @@ variable "max_capacity" {
   type        = number
   default     = 4
 }
+
+variable "hf_token" {
+  description = "HuggingFace Hub write token for pushing fine-tuned BERT checkpoint"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "mlflow_tracking_uri" {
+  description = "MLflow tracking URI (defaults to S3 bucket constructed at apply time)"
+  type        = string
+  default     = ""
+}

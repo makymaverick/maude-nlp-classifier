@@ -2,12 +2,13 @@
 # MAUDE NLP Classifier — GitHub Actions CI/CD Pipeline
 #
 # Triggers:
-#   - push to main  → run tests + build + deploy to ECS (prod)
-#   - pull_request  → run tests only
+#   - push to main  → lint/test → build TF-IDF image → deploy to ECS
+#   - pull_request  → lint/test only
 #
 # Required GitHub Secrets:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,
-#   AWS_ACCOUNT_ID, OPENFDA_API_KEY (optional)
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ACCOUNT_ID
+#   HF_TOKEN             — HuggingFace write token (model hub push)
+#   OPENFDA_API_KEY      — openFDA API key (optional, higher rate limit)
 ################################################################################
 
 name: CI/CD Pipeline
@@ -67,9 +68,9 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
-  # ── Job 2: Build & Push Docker image ───────────────────────────────────────
+  # ── Job 2: Build & Push TF-IDF Docker image ────────────────────────────────
   build:
-    name: Build & Push to ECR
+    name: Build & Push to ECR (TF-IDF)
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -95,7 +96,7 @@ jobs:
       - name: Create placeholder models dir (required by Dockerfile COPY)
         run: mkdir -p models
 
-      - name: Build, tag & push Docker image
+      - name: Build, tag & push Docker image (TF-IDF baseline)
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -103,12 +104,54 @@ jobs:
           IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker build -t $IMAGE_URI .
           docker push $IMAGE_URI
-          # Also tag as 'latest'
           docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
 
-  # ── Job 3: Deploy to ECS Fargate ───────────────────────────────────────────
+  # ── Job 3: Build & Push ClinicalBERT Docker image (CPU inference) ──────────
+  build-bert:
+    name: Build & Push to ECR (ClinicalBERT CPU)
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image: ${{ steps.build-bert-image.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr-bert
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create placeholder models dir
+        run: mkdir -p models
+
+      - name: Build, tag & push BERT Docker image (CPU)
+        id: build-bert-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr-bert.outputs.registry }}
+        run: |
+          BERT_IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:bert-$IMAGE_TAG
+          docker build \
+            --build-arg INCLUDE_BERT=true \
+            --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cpu \
+            -t $BERT_IMAGE_URI .
+          docker push $BERT_IMAGE_URI
+          docker tag $BERT_IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:bert-latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:bert-latest
+          echo "image=$BERT_IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # ── Job 4: Deploy TF-IDF image to ECS Fargate ──────────────────────────────
   deploy:
     name: Deploy to ECS Fargate
     runs-on: ubuntu-latest
@@ -152,4 +195,4 @@ jobs:
       - name: Notify deployment success
         if: success()
         run: |
-          echo "✅ Deployed ${{ env.IMAGE_TAG }} to ECS cluster ${{ env.ECS_CLUSTER }}"
+          echo "Deployed ${{ env.IMAGE_TAG }} to ECS cluster ${{ env.ECS_CLUSTER }}"

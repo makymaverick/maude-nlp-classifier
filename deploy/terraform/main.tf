@@ -20,11 +20,13 @@ terraform {
     }
   }
 
-  # Uncomment to use S3 remote state (recommended for teams)
+  # S3 remote state — create the bucket first (bootstrap/README.md), then uncomment.
   # backend "s3" {
-  #   bucket = "your-terraform-state-bucket"
-  #   key    = "maude-nlp-classifier/terraform.tfstate"
-  #   region = "us-east-1"
+  #   bucket         = "maude-nlp-terraform-state-<account_id>"
+  #   key            = "maude-nlp-classifier/terraform.tfstate"
+  #   region         = "us-east-1"
+  #   dynamodb_table = "maude-nlp-terraform-locks"
+  #   encrypt        = true
   # }
 }
 
@@ -365,5 +367,201 @@ resource "aws_appautoscaling_policy" "cpu" {
     predefined_metric_specification {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
+  }
+}
+
+# ── S3 — Model Checkpoints, MLflow Artifacts, Accumulated Data ───────────────
+resource "aws_s3_bucket" "checkpoints" {
+  bucket        = "${local.name}-checkpoints-${data.aws_caller_identity.current.account_id}"
+  force_destroy = false
+  tags          = merge(local.tags, { Purpose = "model-checkpoints" })
+}
+
+resource "aws_s3_bucket_versioning" "checkpoints" {
+  bucket = aws_s3_bucket.checkpoints.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "checkpoints" {
+  bucket = aws_s3_bucket.checkpoints.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "checkpoints" {
+  bucket                  = aws_s3_bucket.checkpoints.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "checkpoints" {
+  bucket = aws_s3_bucket.checkpoints.id
+
+  rule {
+    id     = "expire-old-checkpoints"
+    status = "Enabled"
+
+    filter { prefix = "checkpoints/" }
+
+    noncurrent_version_expiration { noncurrent_days = 30 }
+  }
+
+  rule {
+    id     = "expire-mlruns"
+    status = "Enabled"
+
+    filter { prefix = "mlruns/" }
+
+    expiration { days = 90 }
+  }
+}
+
+# Grant ECS task role read access to the checkpoints bucket
+resource "aws_iam_role_policy" "ecs_task_s3" {
+  name = "${local.name}-task-s3-policy"
+  role = aws_iam_role.ecs_task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:ListBucket"]
+      Resource = [
+        aws_s3_bucket.checkpoints.arn,
+        "${aws_s3_bucket.checkpoints.arn}/*",
+      ]
+    }]
+  })
+}
+
+# ── SageMaker IAM Role for BERT fine-tuning ───────────────────────────────────
+resource "aws_iam_role" "sagemaker" {
+  name = "${local.name}-sagemaker-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "sagemaker.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "sagemaker_full" {
+  role       = aws_iam_role.sagemaker.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+}
+
+resource "aws_iam_role_policy" "sagemaker_s3" {
+  name = "${local.name}-sagemaker-s3-policy"
+  role = aws_iam_role.sagemaker.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"]
+      Resource = [
+        aws_s3_bucket.checkpoints.arn,
+        "${aws_s3_bucket.checkpoints.arn}/*",
+      ]
+    }]
+  })
+}
+
+# Grant SageMaker role access to the Secrets Manager secret (for OPENFDA_API_KEY)
+resource "aws_iam_role_policy" "sagemaker_secrets" {
+  name = "${local.name}-sagemaker-secrets-policy"
+  role = aws_iam_role.sagemaker.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = aws_secretsmanager_secret.openfda_key.arn
+    }]
+  })
+}
+
+# ── GPU ECS Task Definition — ClinicalBERT batch inference ───────────────────
+# Uses g4dn family via ECS Capacity Provider (EC2, not Fargate) for GPU access.
+# This task is NOT launched continuously — it is invoked on-demand for
+# batch reclassification of the full accumulated dataset.
+resource "aws_ecs_task_definition" "bert_inference" {
+  family                   = "${local.name}-bert"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["EC2"]        # GPU requires EC2 launch type
+  cpu                      = "4096"         # 4 vCPU
+  memory                   = "16384"        # 16 GB
+  execution_role_arn       = aws_iam_role.ecs_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  container_definitions = jsonencode([{
+    name      = "${local.name}-bert"
+    image     = "${aws_ecr_repository.app.repository_url}:bert-latest"
+    essential = true
+
+    resourceRequirements = [{
+      type  = "GPU"
+      value = "1"
+    }]
+
+    portMappings = [{
+      containerPort = 8501
+      hostPort      = 8501
+      protocol      = "tcp"
+    }]
+
+    secrets = [{
+      name      = "OPENFDA_API_KEY"
+      valueFrom = aws_secretsmanager_secret.openfda_key.arn
+    }]
+
+    environment = [
+      { name = "BERT_CHECKPOINT_S3_BUCKET", value = aws_s3_bucket.checkpoints.bucket },
+      { name = "MLFLOW_TRACKING_URI",       value = "s3://${aws_s3_bucket.checkpoints.bucket}/mlruns" },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "ecs-bert"
+      }
+    }
+
+    healthCheck = {
+      command     = ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval    = 30
+      timeout     = 10
+      retries     = 3
+      startPeriod = 180   # BERT model download takes longer
+    }
+  }])
+
+  tags = merge(local.tags, { ModelType = "ClinicalBERT" })
+}
+
+# CloudWatch alarm: alert if ECS BERT task exits unexpectedly
+resource "aws_cloudwatch_metric_alarm" "bert_task_stopped" {
+  alarm_name          = "${local.name}-bert-task-stopped"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "TaskCount"
+  namespace           = "ECS/ContainerInsights"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 0
+  alarm_description   = "BERT ECS task stopped unexpectedly"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = local.name
   }
 }
