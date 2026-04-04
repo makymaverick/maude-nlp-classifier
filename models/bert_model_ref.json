@@ -1,7 +1,12 @@
 {
-  "local_path": null,
-  "hub_repo": null,
-  "hub_sha": null,
-  "label_order": ["D", "I", "M", "O", "UNKNOWN"],
-  "_note": "Populated automatically by train_bert.py after a successful fine-tuning run. Set hub_repo to 'mukundisb/maude-clinicalbert' and ensure HF_TOKEN env var is set to enable HF Hub push."
+  "local_path": "models/bert_checkpoint",
+  "label_order": [
+    "D",
+    "I",
+    "M",
+    "O",
+    "UNKNOWN"
+  ],
+  "hub_repo": "mukundisb/maude-clinicalbert",
+  "hub_sha": "2842930e4823888900c6d054e4474c8a647e4b6f"
 }
