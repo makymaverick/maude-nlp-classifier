@@ -148,14 +148,19 @@ def train_bert(
     texts = df[text_col].tolist()
     encoded_labels, label2id = encode_labels(df[label_col])
 
-    # Class weights — inverse frequency
-    classes = np.array(sorted(set(encoded_labels)))
+    # Class weights — inverse frequency, padded to full LABEL_ORDER length.
+    # When --drop-unknown removes a class, absent classes get weight 0 so the
+    # CrossEntropyLoss weight tensor always matches the model's num_labels (5).
+    present_classes = np.array(sorted(set(encoded_labels)))
     weights = compute_class_weight(
         class_weight="balanced",
-        classes=classes,
+        classes=present_classes,
         y=np.array(encoded_labels),
     )
-    class_weights = torch.tensor(weights, dtype=torch.float).to(device)
+    full_weights = np.zeros(len(LABEL_ORDER))
+    for cls_idx, w in zip(present_classes, weights):
+        full_weights[cls_idx] = w
+    class_weights = torch.tensor(full_weights, dtype=torch.float).to(device)
 
     # 80/20 split for training progress monitoring
     split_idx = int(len(texts) * 0.8)
@@ -287,9 +292,12 @@ def cross_validate_bert(
         train_labels = y[train_idx].tolist()
         val_labels = y[val_idx].tolist()
 
-        classes = np.array(sorted(set(train_labels)))
-        weights = compute_class_weight("balanced", classes=classes, y=np.array(train_labels))
-        class_weights = torch.tensor(weights, dtype=torch.float).to(device)
+        present_classes = np.array(sorted(set(train_labels)))
+        weights = compute_class_weight("balanced", classes=present_classes, y=np.array(train_labels))
+        full_weights = np.zeros(len(LABEL_ORDER))
+        for cls_idx, w in zip(present_classes, weights):
+            full_weights[cls_idx] = w
+        class_weights = torch.tensor(full_weights, dtype=torch.float).to(device)
 
         train_ds = MaudeDataset(train_texts, train_labels, tokenizer, max_length)
         val_ds = MaudeDataset(val_texts, val_labels, tokenizer, max_length)
