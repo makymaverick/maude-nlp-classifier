@@ -26,7 +26,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.ingestion.openfda_client import fetch_maude_records, save_raw_data
+from src.ingestion.openfda_client import fetch_maude_bulk, fetch_maude_records, save_raw_data
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,8 @@ def run_ingestion(
     retrain: bool = True,
     cross_validate: bool = False,
     model_type: str = "logreg",
+    start_year: int = 2015,
+    end_year: int | None = None,
 ) -> dict:
     """
     Execute one incremental ingestion cycle:
@@ -119,10 +121,13 @@ def run_ingestion(
     logger.info(f"=== Incremental ingestion started at {started_at} ===")
     logger.info(f"Batch size: {batch_size:,} records requested")
 
-    # Step 1: Fetch new batch
-    new_df = fetch_maude_records(
+    # Step 1: Fetch new batch (bulk uses date-range windowing to bypass the
+    # openFDA skip=25,000 hard limit, so large batches work correctly)
+    new_df = fetch_maude_bulk(
         total_records=batch_size,
         api_key=api_key or os.getenv("OPENFDA_API_KEY"),
+        start_year=start_year,
+        end_year=end_year,
     )
     logger.info(f"API returned {len(new_df):,} raw records.")
 
@@ -186,6 +191,9 @@ def start_scheduler(
     batch_size: int = 10_000,
     model_type: str = "logreg",
     cross_validate: bool = False,
+    api_key: str | None = None,
+    start_year: int = 2015,
+    end_year: int | None = None,
 ) -> None:
     """
     Start an APScheduler process that runs incremental ingestion on a cron schedule.
@@ -227,9 +235,12 @@ def start_scheduler(
         ),
         kwargs={
             "batch_size": batch_size,
+            "api_key": api_key,
             "retrain": True,
             "cross_validate": cross_validate,
             "model_type": model_type,
+            "start_year": start_year,
+            "end_year": end_year,
         },
         id="maude_incremental_ingestion",
         name="MAUDE Incremental Ingestion + Retrain",
@@ -281,6 +292,18 @@ if __name__ == "__main__":  # pragma: no cover
         "--cron", type=str, default="0 2 * * *",
         help="Cron expression for scheduled runs (default: daily at 2 AM UTC)"
     )
+    parser.add_argument(
+        "--api-key", type=str, default=None, dest="api_key",
+        help="openFDA API key (falls back to OPENFDA_API_KEY env var)"
+    )
+    parser.add_argument(
+        "--start-year", type=int, default=2015, dest="start_year",
+        help="First year of the date-range window (default: 2015)"
+    )
+    parser.add_argument(
+        "--end-year", type=int, default=None, dest="end_year",
+        help="Last year of the date-range window (default: current year)"
+    )
     args = parser.parse_args()
 
     if args.schedule:
@@ -289,11 +312,17 @@ if __name__ == "__main__":  # pragma: no cover
             batch_size=args.batch,
             model_type=args.model,
             cross_validate=args.cross_validate,
+            api_key=args.api_key,
+            start_year=args.start_year,
+            end_year=args.end_year,
         )
     else:
         run_ingestion(
             batch_size=args.batch,
+            api_key=args.api_key,
             retrain=not args.no_retrain,
             cross_validate=args.cross_validate,
             model_type=args.model,
+            start_year=args.start_year,
+            end_year=args.end_year,
         )
