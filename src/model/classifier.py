@@ -116,14 +116,7 @@ def tune_pipeline(
     Returns:
         Best estimator from GridSearchCV.
     """
-    if model_type == "svm":
-        param_grid = {
-            "tfidf__ngram_range": [(1, 1), (1, 2)],
-            "tfidf__max_features": [30_000, 50_000],
-            "clf__C": [0.1, 1.0, 10.0],
-        }
-    else:
-        param_grid = {
+    param_grid = {
             "tfidf__ngram_range": [(1, 1), (1, 2)],
             "tfidf__max_features": [30_000, 50_000],
             "clf__C": [0.1, 1.0, 10.0],

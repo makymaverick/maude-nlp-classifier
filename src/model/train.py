@@ -1,33 +1,21 @@
 """
-Training entrypoint for MAUDE NLP Classifier.
+Training entrypoint for MAUDE NLP Severity Classifier.
 
-Includes:
-  - openFDA batch ingestion (paginated, no static downloads)
-  - Text preprocessing
-  - StratifiedKFold cross-validation (always runs — required for reliable promotion)
-  - Dummy baseline comparison
-  - MLflow experiment tracking & model versioning
-  - Robust model promotion with three safeguards against small-data inflation:
-      1. Comparison uses CV F1, not hold-out F1
-         (CV F1 is far more stable on small datasets)
-      2. Minimum records gate: promotion comparison is skipped until
-         MIN_RECORDS_FOR_COMPARISON records are accumulated
-         (below this threshold, metrics are unreliable and the first
-          trained model is always promoted)
-      3. Tolerance band: new model must beat champion CV F1 by at least
-         PROMOTION_MIN_DELTA, not just epsilon
-         (prevents promoting noise as signal)
+Fetches adverse event records from the openFDA MAUDE API, preprocesses
+narrative text, trains a TF-IDF + classifier pipeline, evaluates with
+StratifiedKFold cross-validation, and promotes the new model only if
+its CV F1 beats the current champion.
 
 Usage:
     python -m src.model.train --records 5000 --model logreg
-    python -m src.model.train --records 10000 --model logreg --tune
+    python -m src.model.train --records 5000 --model logreg --tune
+    python -m src.model.train --records 5000 --use-cached --drop-unknown
 """
 
 import argparse
+import json
 import logging
 import os
-import json
-from pathlib import Path
 
 import mlflow
 import mlflow.sklearn
@@ -44,64 +32,38 @@ from src.model.classifier import (
     cross_validate_pipeline,
     dummy_baseline,
     save_model,
-    load_model,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-RAW_DATA_PATH = "data/raw/maude_raw.csv"
-MODEL_PATH = "models/maude_classifier.joblib"
+RAW_DATA_PATH         = "data/raw/maude_raw.csv"
+MODEL_PATH            = "models/maude_classifier.joblib"
 CHAMPION_METRICS_PATH = "models/champion_metrics.json"
-MLFLOW_EXPERIMENT = "maude-nlp-severity"
-
-# ── Promotion safeguard constants ────────────────────────────────────────────
-#
-# Below this record count, the dataset is too small for metrics to be reliable.
-# The first model trained above this threshold becomes the baseline champion.
-# Any model trained with fewer records is always promoted (no comparison).
-MIN_RECORDS_FOR_COMPARISON = 10_000
-
-# New model must beat the champion's CV F1 by at least this much.
-# Prevents promoting a model that improved by statistical noise (e.g. 0.001).
-# Rule of thumb: ~0.5-1% of F1 is meaningful on a real dataset.
-PROMOTION_MIN_DELTA = 0.005
+MLFLOW_EXPERIMENT     = "maude-nlp-severity"
 
 
 # ── Champion metrics helpers ─────────────────────────────────────────────────
 
-def _get_champion_metrics() -> dict:
-    """
-    Read the current champion's metrics from disk.
-
-    Returns an empty dict if no champion exists yet.
-    The key used for promotion comparison is 'cv_f1_mean', not 'f1_weighted',
-    because CV F1 is stable across dataset sizes whereas hold-out F1 is not.
-    """
-    if os.path.exists(CHAMPION_METRICS_PATH):
-        with open(CHAMPION_METRICS_PATH) as f:
-            return json.load(f)
-    return {}
-
-
-def _get_champion_f1() -> float:
-    """Return champion's CV F1 mean (used by tests and Streamlit dashboard)."""
-    data = _get_champion_metrics()
-    # Prefer cv_f1_mean; fall back to f1_weighted for backwards compatibility
-    return data.get("cv_f1_mean") or data.get("f1_weighted", 0.0)
+def _load_champion_metrics() -> dict:
+    """Read current champion metrics from disk. Returns {} if none exists."""
+    if not os.path.exists(CHAMPION_METRICS_PATH):
+        return {}
+    with open(CHAMPION_METRICS_PATH) as f:
+        return json.load(f)
 
 
 def _save_champion_metrics(metrics: dict) -> None:
-    """Persist the promoted model's metrics."""
+    """Persist the promoted model's metrics to disk."""
     os.makedirs(os.path.dirname(CHAMPION_METRICS_PATH), exist_ok=True)
     with open(CHAMPION_METRICS_PATH, "w") as f:
         json.dump(
             {
-                "f1_weighted": metrics["f1_weighted"],
-                "accuracy": metrics["accuracy"],
-                "cv_f1_mean": metrics.get("cv_f1_mean"),
-                "cv_f1_std": metrics.get("cv_f1_std"),
-                "training_records": metrics.get("training_records"),
+                "accuracy":          metrics["accuracy"],
+                "f1_weighted":       metrics["f1_weighted"],
+                "cv_f1_mean":        metrics.get("cv_f1_mean"),
+                "cv_f1_std":         metrics.get("cv_f1_std"),
+                "training_records":  metrics.get("training_records"),
             },
             f,
             indent=2,
@@ -109,69 +71,21 @@ def _save_champion_metrics(metrics: dict) -> None:
     logger.info(f"Champion metrics saved to {CHAMPION_METRICS_PATH}")
 
 
-def _should_promote(
-    new_cv_f1: float,
-    champion_cv_f1: float,
-    training_records: int,
-    no_champion_exists: bool,
-) -> tuple[bool, str]:
-    """
-    Decide whether to promote the new model to champion, and explain why.
+# ── Main ─────────────────────────────────────────────────────────────────────
 
-    Three-gate promotion logic:
+def main(args: argparse.Namespace) -> None:
 
-    Gate 1 — No existing champion: always promote.
-    Gate 2 — Minimum records: below MIN_RECORDS_FOR_COMPARISON, always promote
-              because there is not enough data for the metrics to be trustworthy.
-    Gate 3 — CV F1 improvement with tolerance band: new CV F1 must exceed
-              champion CV F1 by at least PROMOTION_MIN_DELTA.
-
-    Returns:
-        Tuple of (should_promote: bool, reason: str)
-    """
-    if no_champion_exists:
-        return True, "no_champion_exists"
-
-    if training_records < MIN_RECORDS_FOR_COMPARISON:
-        return True, (
-            f"below_min_records_threshold "
-            f"({training_records} < {MIN_RECORDS_FOR_COMPARISON}) — "
-            f"metrics unreliable on small datasets, always promoting"
-        )
-
-    improvement = new_cv_f1 - champion_cv_f1
-    if improvement >= PROMOTION_MIN_DELTA:
-        return True, (
-            f"cv_f1_improved "
-            f"({new_cv_f1:.4f} vs {champion_cv_f1:.4f}, "
-            f"delta={improvement:+.4f} >= threshold={PROMOTION_MIN_DELTA})"
-        )
-
-    return False, (
-        f"cv_f1_insufficient_improvement "
-        f"({new_cv_f1:.4f} vs {champion_cv_f1:.4f}, "
-        f"delta={improvement:+.4f} < threshold={PROMOTION_MIN_DELTA})"
-    )
-
-
-# ── Main training function ───────────────────────────────────────────────────
-
-def main(args):
-    # Set up MLflow
-    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "mlruns"))
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
     with mlflow.start_run() as run:
         logger.info(f"MLflow run ID: {run.info.run_id}")
 
-        # Log training configuration
         mlflow.log_params({
-            "model_type": args.model,
-            "records_requested": getattr(args, "records", "N/A"),
-            "drop_unknown": args.drop_unknown,
+            "model_type":            args.model,
+            "records_requested":     args.records,
+            "drop_unknown":          args.drop_unknown,
             "hyperparameter_tuning": args.tune,
-            "min_records_for_comparison": MIN_RECORDS_FOR_COMPARISON,
-            "promotion_min_delta": PROMOTION_MIN_DELTA,
         })
 
         # ── 1. Ingest ────────────────────────────────────────────────────────
@@ -179,11 +93,11 @@ def main(args):
             logger.info(f"Loading cached data from {RAW_DATA_PATH}")
             df = pd.read_csv(RAW_DATA_PATH)
         else:
-            logger.info(f"Fetching {args.records} records from openFDA MAUDE API...")
+            logger.info(f"Fetching {args.records:,} records from openFDA MAUDE API...")
             df = fetch_maude_records(total_records=args.records)
             save_raw_data(df, RAW_DATA_PATH)
 
-        logger.info(f"Raw data shape: {df.shape}")
+        logger.info(f"Raw records: {len(df):,}")
         mlflow.log_param("records_fetched", len(df))
 
         # ── 2. Preprocess ────────────────────────────────────────────────────
@@ -192,122 +106,132 @@ def main(args):
         if args.drop_unknown:
             before = len(df)
             df = df[df["severity_label"] != "UNKNOWN"].reset_index(drop=True)
-            logger.info(f"Dropped UNKNOWN labels: {before - len(df)} rows removed.")
+            logger.info(f"Dropped {before - len(df)} UNKNOWN-labelled rows.")
 
         label_dist = get_label_distribution(df)
-        logger.info(f"Label distribution after cleaning:\n{label_dist}")
+        logger.info(f"Label distribution:\n{label_dist}")
 
         for label, count in label_dist.items():
-            mlflow.log_metric(f"class_count_{label}", count)
+            mlflow.log_metric(f"class_count_{label}", int(count))
 
         mlflow.log_param("training_records", len(df))
 
         if len(df) < 50:
-            logger.error("Not enough records after cleaning. Aborting.")
+            logger.error("Fewer than 50 records after cleaning — aborting.")
             return
 
-        # ── 3. Train/test split ──────────────────────────────────────────────
+        # ── 3. Train / test split ────────────────────────────────────────────
         X_train, X_test, y_train, y_test = split_data(df)
 
-        # ── 4. Dummy baseline (sanity check) ─────────────────────────────────
+        # ── 4. Dummy baseline ────────────────────────────────────────────────
+        #
+        # Sanity check: a model that simply predicts the majority class will
+        # score well on accuracy when classes are imbalanced.  The dummy
+        # baseline makes this explicit — our model must beat it meaningfully.
         dummy = dummy_baseline(X_train, y_train, X_test, y_test)
         mlflow.log_metrics({
-            "dummy_accuracy": dummy["dummy_accuracy"],
+            "dummy_accuracy":    dummy["dummy_accuracy"],
             "dummy_f1_weighted": dummy["dummy_f1_weighted"],
         })
 
-        # ── 5. Build & train ─────────────────────────────────────────────────
+        # ── 5. Build + train ─────────────────────────────────────────────────
         pipeline = build_pipeline(model_type=args.model)
         if args.tune:
             pipeline = tune_pipeline(pipeline, X_train, y_train, model_type=args.model)
         else:
             pipeline = train_pipeline(pipeline, X_train, y_train)
 
-        # ── 6. StratifiedKFold cross-validation (always runs) ────────────────
+        # ── 6. StratifiedKFold cross-validation ──────────────────────────────
         #
-        # CV F1 is the single source of truth for the promotion decision.
-        # It must always run so that every model has a comparable, stable score.
-        # A single hold-out split on a small dataset can vary by ±0.10–0.15 F1
-        # depending on which records end up in the test set; CV F1 variance
-        # is typically 3–5x lower.
-        logger.info("Running 5-fold stratified cross-validation (required for promotion)...")
-        fresh_pipe = build_pipeline(model_type=args.model)
+        # We use CV F1 — not hold-out F1 — as the promotion signal because
+        # a single train/test split on a small dataset can vary by ±0.10 F1
+        # depending on which records land in the test set.  Five-fold CV is
+        # 3–5× more stable.
+        #
+        # A fresh (untrained) pipeline is passed to cross_validate_pipeline
+        # so that each fold trains independently — no data leakage.
+        logger.info("Running 5-fold stratified cross-validation...")
+        cv_pipeline = build_pipeline(model_type=args.model)
         cv_results = cross_validate_pipeline(
-            fresh_pipe, df["clean_text"], df["severity_label"], n_splits=5
+            cv_pipeline, df["clean_text"], df["severity_label"], n_splits=5
         )
-        cv_metrics = {
-            "cv_f1_mean": cv_results["cv_f1_mean"],
-            "cv_f1_std": cv_results["cv_f1_std"],
-        }
-        mlflow.log_metrics(cv_metrics)
-        for i, fold_score in enumerate(cv_results["cv_f1_per_fold"]):
-            mlflow.log_metric(f"cv_f1_fold_{i+1}", fold_score)
+        cv_f1_mean = cv_results["cv_f1_mean"]
+        cv_f1_std  = cv_results["cv_f1_std"]
 
-        # ── 7. Hold-out evaluation (for reporting, not for promotion) ────────
+        mlflow.log_metrics({
+            "cv_f1_mean": cv_f1_mean,
+            "cv_f1_std":  cv_f1_std,
+        })
+        for i, score in enumerate(cv_results["cv_f1_per_fold"]):
+            mlflow.log_metric(f"cv_f1_fold_{i + 1}", score)
+
+        # ── 7. Hold-out evaluation ───────────────────────────────────────────
         metrics = evaluate(pipeline, X_test, y_test)
-        metrics.update(cv_metrics)
+        metrics["cv_f1_mean"]       = cv_f1_mean
+        metrics["cv_f1_std"]        = cv_f1_std
         metrics["training_records"] = len(df)
 
         mlflow.log_metrics({
-            "accuracy": metrics["accuracy"],
+            "accuracy":    metrics["accuracy"],
             "f1_weighted": metrics["f1_weighted"],
         })
         mlflow.log_text(metrics["classification_report"], "classification_report.txt")
         mlflow.sklearn.log_model(pipeline, "model")
 
+        beats_dummy = metrics["f1_weighted"] > dummy["dummy_f1_weighted"]
         logger.info(
-            f"\n{'='*55}\n"
-            f"  Records trained on: {len(df):,}\n"
-            f"  Hold-out Accuracy:  {metrics['accuracy']:.4f}\n"
-            f"  Hold-out F1:        {metrics['f1_weighted']:.4f}  "
-            f"({'BEATS' if metrics['f1_weighted'] > dummy['dummy_f1_weighted'] else 'DOES NOT BEAT'} "
-            f"dummy={dummy['dummy_f1_weighted']:.4f})\n"
-            f"  CV F1 (5-fold):     {cv_metrics['cv_f1_mean']:.4f} "
-            f"± {cv_metrics['cv_f1_std']:.4f}  ← used for promotion\n"
-            f"{'='*55}"
+            f"\n{'=' * 55}\n"
+            f"  Records:          {len(df):,}\n"
+            f"  Hold-out F1:      {metrics['f1_weighted']:.4f}"
+            f"  ({'BEATS' if beats_dummy else 'DOES NOT BEAT'}"
+            f" dummy={dummy['dummy_f1_weighted']:.4f})\n"
+            f"  CV F1 (5-fold):   {cv_f1_mean:.4f} ± {cv_f1_std:.4f}  <- promotion signal\n"
+            f"{'=' * 55}"
         )
 
-        # ── 8. Robust model promotion ────────────────────────────────────────
-        champion_data = _get_champion_metrics()
-        no_champion = not champion_data
-        champion_cv_f1 = _get_champion_f1()
-        new_cv_f1 = cv_metrics["cv_f1_mean"]
+        # ── 8. Model promotion ───────────────────────────────────────────────
+        #
+        # Promote if CV F1 improves over the current champion.
+        # Using CV F1 for the comparison — same reason as above.
+        champion = _load_champion_metrics()
+        champion_cv_f1 = champion.get("cv_f1_mean") or champion.get("f1_weighted", 0.0)
+        no_champion = not champion
 
-        promote, reason = _should_promote(
-            new_cv_f1=new_cv_f1,
-            champion_cv_f1=champion_cv_f1,
-            training_records=len(df),
-            no_champion_exists=no_champion,
-        )
+        if no_champion:
+            promote, reason = True, "no_champion_exists"
+        elif cv_f1_mean > champion_cv_f1:
+            promote = True
+            reason  = f"cv_f1_improved ({cv_f1_mean:.4f} > {champion_cv_f1:.4f})"
+        else:
+            promote = False
+            reason  = f"champion_retained ({champion_cv_f1:.4f} >= {cv_f1_mean:.4f})"
 
         mlflow.log_metric("champion_cv_f1_before", champion_cv_f1)
+        mlflow.set_tag("promoted",         str(promote).lower())
         mlflow.set_tag("promotion_reason", reason)
 
         if promote:
-            logger.info(f"✅ Promoting new model. Reason: {reason}")
+            logger.info(f"Promoting new model. Reason: {reason}")
             save_model(pipeline, MODEL_PATH)
             _save_champion_metrics(metrics)
-            mlflow.set_tag("promoted", "true")
         else:
-            logger.info(f"⏭️  Keeping existing champion. Reason: {reason}")
-            mlflow.set_tag("promoted", "false")
+            logger.info(f"Keeping existing champion. Reason: {reason}")
 
-        mlflow.set_tag("model_type", args.model)
-        logger.info(f"Training complete. MLflow run: {run.info.run_id}")
+        logger.info(f"Done. MLflow run: {run.info.run_id}")
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MAUDE NLP Severity Classifier")
-    parser.add_argument("--records", type=int, default=5000,
-                        help="Number of MAUDE records to fetch per run")
-    parser.add_argument("--model", type=str, default="logreg",
+    parser.add_argument("--records",     type=int,  default=5000,
+                        help="Records to fetch from openFDA per run (default 5000)")
+    parser.add_argument("--model",       type=str,  default="logreg",
                         choices=["logreg", "svm"],
-                        help="Classifier type: logreg or svm")
-    parser.add_argument("--tune", action="store_true",
+                        help="Classifier backend: logreg (default) or svm")
+    parser.add_argument("--tune",        action="store_true",
                         help="Run GridSearchCV hyperparameter tuning")
-    parser.add_argument("--use-cached", action="store_true",
-                        help="Load from cached CSV instead of re-fetching from API")
+    parser.add_argument("--use-cached",  action="store_true",
+                        help="Load from data/raw/maude_raw.csv instead of re-fetching")
     parser.add_argument("--drop-unknown", action="store_true",
-                        help="Exclude records with UNKNOWN severity from training")
+                        help="Exclude UNKNOWN severity records from training")
     args = parser.parse_args()
     main(args)

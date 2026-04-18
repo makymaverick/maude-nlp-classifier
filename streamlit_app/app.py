@@ -1,72 +1,43 @@
 """
-MAUDE NLP Classifier — Streamlit Demo App
+MAUDE NLP Severity Classifier — Streamlit Demo App
 
-Tabs:
-  1. Train Model         — fetch data, train, view metrics
-  2. Single Inference    — classify a free-text narrative
-  3. Data Explorer       — filter, search, download records
-  4. Pipeline Dashboard  — incremental ingestion status + MLflow run history
+Two tabs:
+  1. Classify      — paste a MAUDE narrative, get a severity prediction
+  2. About         — model card: training data, approach, evaluation metrics
 """
 
-import os
-import sys
 import json
 import logging
+import os
+import sys
 from pathlib import Path
 
-import streamlit as st
-import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
-
-# Add project root to path so imports work from streamlit_app/
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from src.ingestion.openfda_client import fetch_maude_records
-from src.ingestion.incremental import (
-    run_ingestion,
-    load_accumulated,
-    ACCUMULATED_DATA_PATH,
-)
-from src.preprocessing.text_cleaner import clean_dataframe, clean_text
-from src.model.classifier import (
-    build_pipeline,
-    split_data,
-    train_pipeline,
-    evaluate,
-    cross_validate_pipeline,
-    dummy_baseline,
-    predict_single,
-    save_model,
-    load_model,
-)
-
-# ClinicalBERT — imported lazily so the app loads even without torch installed
-_bert_available = False
-try:
-    from src.model.bert_classifier import (
-        predict_bert,
-        load_bert_from_ref,
-        BERT_MODEL_REF_PATH,
-    )
-    _bert_available = True
-except ImportError:
-    pass
+import streamlit as st
 
 matplotlib.use("Agg")
 
-MODEL_PATH = "models/maude_classifier.joblib"
-CHAMPION_METRICS_PATH = "models/champion_metrics.json"
-BERT_MODEL_REF_PATH_LOCAL = "models/bert_model_ref.json"
-BERT_CHECKPOINT_DIR = "models/bert_checkpoint"
+# Add project root so src.* imports resolve from streamlit_app/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Short-code label colours
+from src.model.classifier import load_model, predict_single
+from src.preprocessing.text_cleaner import clean_text
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MODEL_PATH            = "models/maude_classifier.joblib"
+CHAMPION_METRICS_PATH = "models/champion_metrics.json"
+
+# Severity label display config
 SEVERITY_COLORS = {
-    "D": "#d62728",    # Death — red
-    "I": "#ff7f0e",    # Injury — orange
-    "M": "#1f77b4",    # Malfunction — blue
-    "O": "#7f7f7f",    # Other — grey
+    "D": "#d62728",
+    "I": "#ff7f0e",
+    "M": "#1f77b4",
+    "O": "#7f7f7f",
     "UNKNOWN": "#aaaaaa",
 }
 LABEL_NAMES = {
@@ -77,35 +48,30 @@ LABEL_NAMES = {
     "UNKNOWN": "Unknown",
 }
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ── Sample narratives (let recruiters/interviewers try the demo immediately) ─
+SAMPLE_NARRATIVES = {
+    "Select a sample…": "",
+    "Device malfunction during procedure": (
+        "The catheter failed to navigate to the target site during the procedure. "
+        "The device kinked and could not be advanced. The procedure was aborted and "
+        "the device was removed. No patient injury was reported."
+    ),
+    "Serious patient injury": (
+        "Patient experienced significant blood loss following device failure during "
+        "implantation. Emergency intervention was required. Patient was transferred "
+        "to ICU and required transfusion. The device lead had fractured at the "
+        "connector site."
+    ),
+    "Patient death following device use": (
+        "Patient was found unresponsive approximately 6 hours after device activation. "
+        "Resuscitation attempts were unsuccessful. Autopsy results pending. "
+        "The implanted neurostimulator was recovered for analysis. "
+        "Cause of death under investigation."
+    ),
+}
 
 
-@st.cache_resource(show_spinner="Loading ClinicalBERT model…")
-def _load_bert_cached():
-    """Load BERT checkpoint once per container lifecycle."""
-    if not _bert_available:
-        return None, None
-    try:
-        return load_bert_from_ref()
-    except Exception as e:
-        logger.warning(f"Could not load BERT checkpoint: {e}")
-        return None, None
-
-
-def _bert_checkpoint_exists() -> bool:
-    """True if a BERT checkpoint has been trained and the ref file is populated."""
-    if not _bert_available or not os.path.exists(BERT_MODEL_REF_PATH_LOCAL):
-        return False
-    with open(BERT_MODEL_REF_PATH_LOCAL) as f:
-        ref = json.load(f)
-    local_path = ref.get("local_path")
-    hub_repo = ref.get("hub_repo")
-    return bool((local_path and os.path.isdir(local_path)) or hub_repo)
-
-# ─────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="MAUDE NLP Classifier",
     page_icon="🏥",
@@ -115,482 +81,292 @@ st.set_page_config(
 
 st.title("🏥 MAUDE Adverse Event Severity Classifier")
 st.markdown(
-    "Classify medical device adverse event reports from the "
-    "[openFDA MAUDE database](https://open.fda.gov/apis/device/event/) "
-    "by severity: **D**eath · **I**njury · **M**alfunction · **O**ther"
+    "Classifies FDA MAUDE medical device adverse event narratives by severity: "
+    "**Death · Injury · Malfunction · Other**. "
+    "Built on 9 years of domain expertise in post-market surveillance and adverse "
+    "event reporting."
 )
 
-# ─────────────────────────────────────────────
-# Sidebar — Configuration
-# ─────────────────────────────────────────────
+
+# ── Sidebar — model status ────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    api_key = st.text_input(
-        "openFDA API Key (optional)",
-        type="password",
-        help="Leave blank to use the public rate limit.",
-    )
-    num_records = st.slider("Records to Fetch", 100, 10_000, 1000, 100)
-    model_type = st.selectbox("Classifier", ["logreg", "svm"], index=0)
-    drop_unknown = st.checkbox("Exclude UNKNOWN labels", value=True)
-    run_tuning = st.checkbox("GridSearchCV Tuning", value=False)
-    run_cv = st.checkbox("5-Fold Cross-Validation", value=True,
-                          help="Recommended — gives realistic generalisation estimate.")
+    st.header("Model Status")
 
-    st.divider()
-
-    # ── Model selector (Phase 1) ──────────────────────────────────────────
-    st.markdown("**Inference Model**")
-    _bert_ready = _bert_checkpoint_exists()
-    _inference_options = ["TF-IDF (baseline)"]
-    if _bert_available:
-        _bert_label = "ClinicalBERT" if _bert_ready else "ClinicalBERT (not trained yet)"
-        _inference_options.append(_bert_label)
-
-    inference_model = st.radio(
-        "Select model for Single Inference",
-        _inference_options,
-        index=0,
-        help=(
-            "TF-IDF: fast, ~4 MB, trains in seconds.\n"
-            "ClinicalBERT: +5–12 F1 pts, ~440 MB, requires GPU to fine-tune "
-            "(run train_bert.py first)."
-        ),
-    )
-    use_bert_inference = inference_model.startswith("ClinicalBERT") and _bert_ready
-
-    st.divider()
-    st.markdown("**Model status**")
     if os.path.exists(MODEL_PATH):
-        st.success("✅ TF-IDF model found")
+        st.success("✅ Model ready")
         if os.path.exists(CHAMPION_METRICS_PATH):
             with open(CHAMPION_METRICS_PATH) as f:
                 champ = json.load(f)
-            champ_type = champ.get("model_type", "tfidf")
-            st.metric(
-                f"Champion F1 ({champ_type})",
-                f"{champ.get('f1_weighted') or champ.get('cv_f1_mean') or 0:.3f}",
-            )
-            st.metric("Trained on", f"{champ.get('training_records', '?')} records")
+            cv_f1 = champ.get("cv_f1_mean") or champ.get("f1_weighted", 0)
+            st.metric("CV F1 (5-fold)", f"{cv_f1:.3f}")
+            st.metric("Trained on", f"{champ.get('training_records', '?'):,} records")
     else:
-        st.warning("⚠️ No TF-IDF model yet — train below")
-
-    if _bert_available:
-        if _bert_ready:
-            st.success("✅ ClinicalBERT checkpoint found")
-        else:
-            st.info("ℹ️ ClinicalBERT not trained yet\n`python -m src.model.train_bert`")
-
-# ─────────────────────────────────────────────
-# Tabs
-# ─────────────────────────────────────────────
-tab_train, tab_infer, tab_explore, tab_pipeline = st.tabs([
-    "🔧 Train Model",
-    "🔍 Single Inference",
-    "📊 Data Explorer",
-    "🔄 Pipeline Dashboard",
-])
-
-# ══════════════════════════════════════════════
-# TAB 1 — Train Model
-# ══════════════════════════════════════════════
-with tab_train:
-    st.subheader("Train the Classifier")
-    st.markdown(
-        "Fetches records live from the openFDA API, preprocesses narrative text, "
-        "runs a dummy baseline sanity check, and trains a "
-        f"**{'Logistic Regression' if model_type == 'logreg' else 'Linear SVM'}** model."
-    )
-
-    train_btn = st.button("🚀 Fetch Data & Train", use_container_width=True)
-
-    if train_btn:
-        progress = st.progress(0, text="Fetching data from openFDA...")
-
-        with st.spinner("Contacting openFDA API..."):
-            df_raw = fetch_maude_records(
-                total_records=num_records,
-                api_key=api_key or None,
-            )
-        progress.progress(25, text="Preprocessing...")
-
-        df = clean_dataframe(df_raw)
-        if drop_unknown:
-            df = df[df["severity_label"] != "UNKNOWN"].reset_index(drop=True)
-
-        if len(df) < 50:
-            st.error("Not enough records after cleaning. Increase record count.")
-            st.stop()
-
-        # Label distribution
-        st.markdown("**Label Distribution**")
-        dist = df["severity_label"].value_counts().reset_index()
-        dist.columns = ["Code", "Count"]
-        dist["Label"] = dist["Code"].map(LABEL_NAMES)
-        fig, ax = plt.subplots(figsize=(6, 3))
-        colors = [SEVERITY_COLORS.get(c, "#aaa") for c in dist["Code"]]
-        ax.barh(dist["Label"], dist["Count"], color=colors)
-        ax.set_xlabel("Count")
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-
-        progress.progress(40, text="Running dummy baseline...")
-        X_train, X_test, y_train, y_test = split_data(df)
-        dummy = dummy_baseline(X_train, y_train, X_test, y_test)
-
-        st.info(
-            f"**Dummy baseline F1: {dummy['dummy_f1_weighted']:.3f}** — "
-            "your model must beat this to be meaningful."
+        st.warning(
+            "⚠️ No trained model found.\n\n"
+            "Run from the project root:\n"
+            "```\npython -m src.model.train --records 5000\n```"
         )
 
-        progress.progress(55, text="Training model...")
-        pipeline = build_pipeline(model_type=model_type)
-        if run_tuning:
-            from src.model.classifier import tune_pipeline
-            pipeline = tune_pipeline(pipeline, X_train, y_train, model_type=model_type)
-        else:
-            pipeline = train_pipeline(pipeline, X_train, y_train)
+    st.divider()
+    st.caption(
+        "Model: TF-IDF + Logistic Regression\n\n"
+        "Data source: openFDA MAUDE API\n\n"
+        "Evaluation: StratifiedKFold (5-fold)\n\n"
+        "[GitHub](https://github.com/makymaverick/maude-nlp-classifier)"
+    )
 
-        # Cross-validation
-        cv_result = None
-        if run_cv:
-            progress.progress(70, text="Running 5-fold cross-validation...")
-            fresh = build_pipeline(model_type=model_type)
-            cv_result = cross_validate_pipeline(fresh, df["clean_text"], df["severity_label"])
 
-        progress.progress(85, text="Evaluating on held-out test set...")
-        metrics = evaluate(pipeline, X_test, y_test)
-        save_model(pipeline, MODEL_PATH)
-        progress.progress(100, text="Done!")
+# ── Load model (cached) ───────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading model…")
+def _load_model_cached():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    try:
+        return load_model(MODEL_PATH)
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        return None
 
-        # Results
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Accuracy", f"{metrics['accuracy']:.3f}")
-        col2.metric("Weighted F1", f"{metrics['f1_weighted']:.3f}",
-                    delta=f"+{metrics['f1_weighted'] - dummy['dummy_f1_weighted']:.3f} vs dummy")
-        if cv_result:
-            col3.metric("CV F1 (5-fold)",
-                        f"{cv_result['cv_f1_mean']:.3f} ± {cv_result['cv_f1_std']:.3f}")
 
-        st.markdown("**Classification Report**")
-        st.code(metrics["classification_report"])
+pipeline = _load_model_cached()
 
-        st.markdown("**Confusion Matrix**")
-        cm = metrics["confusion_matrix"]
-        classes = metrics["classes"]
-        fig2, ax2 = plt.subplots(figsize=(5, 4))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                    xticklabels=classes, yticklabels=classes, ax=ax2)
-        ax2.set_xlabel("Predicted")
-        ax2.set_ylabel("Actual")
-        plt.tight_layout()
-        st.pyplot(fig2)
-        plt.close()
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab_classify, tab_about = st.tabs(["🔍 Classify", "ℹ️ About the model"])
 
-        st.session_state["df_train"] = df
 
-# ══════════════════════════════════════════════
-# TAB 2 — Single Inference
-# ══════════════════════════════════════════════
-with tab_infer:
-    st.subheader("Classify a Single Adverse Event Narrative")
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — CLASSIFY
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_classify:
+    st.subheader("Classify an adverse event narrative")
+    st.markdown(
+        "Paste the free-text narrative from an MDR report below. "
+        "The model cleans and vectorises the text and returns a predicted "
+        "severity class with confidence scores."
+    )
 
-    sample_texts = {
-        "Select a sample...": "",
-        "Device malfunction (pump)": (
-            "The infusion pump alarmed and stopped delivering medication. "
-            "No patient injury was reported. The device was returned for analysis."
-        ),
-        "Patient death": (
-            "The patient experienced cardiac arrest following implantation of the pacemaker. "
-            "The patient passed away 48 hours post-procedure. The event was considered device-related."
-        ),
-        "Serious injury — burn": (
-            "The patient sustained third degree burns on the left forearm during "
-            "electrosurgical procedure due to a grounding pad malfunction."
-        ),
-    }
+    # Sample narrative picker
+    sample_choice = st.selectbox("Or load a sample narrative:", list(SAMPLE_NARRATIVES.keys()))
+    sample_text = SAMPLE_NARRATIVES[sample_choice]
 
-    sample_choice = st.selectbox("Load a sample narrative", list(sample_texts.keys()))
     narrative_input = st.text_area(
-        "Narrative Text",
-        value=sample_texts[sample_choice],
-        height=150,
-        placeholder="Paste or type the MDR narrative here...",
+        "Narrative text",
+        value=sample_text,
+        height=180,
+        placeholder=(
+            "Paste the MDR narrative here. Example: 'The device failed to deploy "
+            "during the procedure. No patient injury was reported…'"
+        ),
     )
 
-    # Show which model will be used
-    if use_bert_inference:
-        st.info("Using **ClinicalBERT** for inference. First run may take ~30s to load the model.")
-    else:
-        st.info("Using **TF-IDF** baseline for inference.")
+    col_classify, col_clear = st.columns([1, 5])
+    classify_clicked = col_classify.button("Classify", type="primary", use_container_width=True)
+    if col_clear.button("Clear", use_container_width=True):
+        narrative_input = ""
+        st.rerun()
 
-    if st.button("🔎 Classify", use_container_width=True):
+    if classify_clicked:
         if not narrative_input.strip():
-            st.warning("Please enter a narrative text.")
-        elif use_bert_inference:
-            # ── ClinicalBERT inference ────────────────────────────────────
-            bert_model, bert_tokenizer = _load_bert_cached()
-            if bert_model is None:
-                st.error("ClinicalBERT checkpoint could not be loaded. Check logs.")
-            else:
-                # Preserve digits for BERT
-                cleaned = clean_text(narrative_input, preserve_digits=True)
-                with st.spinner("Running ClinicalBERT inference…"):
-                    result = predict_bert(bert_model, bert_tokenizer, cleaned)
-
-                predicted = result["predicted_label"]
-                label_name = LABEL_NAMES.get(predicted, predicted)
-                color = SEVERITY_COLORS.get(predicted, "#333333")
-
-                st.markdown(
-                    f"<div style='background:{color};padding:16px;border-radius:8px;"
-                    f"color:white;font-size:22px;font-weight:bold;text-align:center'>"
-                    f"Predicted: {label_name} ({predicted}) — ClinicalBERT</div>",
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown("**Class Probabilities**")
-                proba_df = pd.DataFrame(
-                    result["probabilities"].items(), columns=["Code", "Probability"]
-                ).sort_values("Probability", ascending=False)
-                proba_df["Label"] = proba_df["Code"].map(LABEL_NAMES)
-
-                fig3, ax3 = plt.subplots(figsize=(6, 3))
-                bar_colors = [SEVERITY_COLORS.get(c, "#aaa") for c in proba_df["Code"]]
-                ax3.barh(proba_df["Label"], proba_df["Probability"], color=bar_colors)
-                ax3.set_xlim(0, 1)
-                ax3.set_xlabel("Probability")
-                plt.tight_layout()
-                st.pyplot(fig3)
-                plt.close()
-
-        elif not os.path.exists(MODEL_PATH):
-            st.error("No TF-IDF model found. Train the model first.")
+            st.warning("Please enter a narrative to classify.")
+        elif pipeline is None:
+            st.error(
+                "No trained model found. "
+                "Run `python -m src.model.train --records 5000` from the project root first."
+            )
         else:
-            # ── TF-IDF inference ──────────────────────────────────────────
-            pipeline = load_model(MODEL_PATH)
+            # Clean text before inference (same pipeline as training)
             cleaned = clean_text(narrative_input)
-            result = predict_single(pipeline, cleaned)
 
-            predicted = result["predicted_label"]
-            label_name = LABEL_NAMES.get(predicted, predicted)
-            color = SEVERITY_COLORS.get(predicted, "#333333")
+            if not cleaned:
+                st.warning("The narrative was empty after cleaning. Try a longer text.")
+            else:
+                result = predict_single(pipeline, cleaned)
+                label_code = result["predicted_label"]
+                label_name = LABEL_NAMES.get(label_code, label_code)
+                color = SEVERITY_COLORS.get(label_code, "#888888")
 
-            st.markdown(
-                f"<div style='background:{color};padding:16px;border-radius:8px;"
-                f"color:white;font-size:22px;font-weight:bold;text-align:center'>"
-                f"Predicted: {label_name} ({predicted})</div>",
-                unsafe_allow_html=True,
-            )
+                st.divider()
+                col_pred, col_scores = st.columns([1, 2])
 
-            if "probabilities" in result:
-                st.markdown("**Class Probabilities**")
-                proba_df = pd.DataFrame(
-                    result["probabilities"].items(), columns=["Code", "Probability"]
-                ).sort_values("Probability", ascending=False)
-                proba_df["Label"] = proba_df["Code"].map(LABEL_NAMES)
+                with col_pred:
+                    st.markdown("**Predicted severity**")
+                    st.markdown(
+                        f"<div style='background:{color}22; border-left:5px solid {color}; "
+                        f"padding:16px 20px; border-radius:6px;'>"
+                        f"<span style='font-size:2rem; font-weight:700; color:{color};'>"
+                        f"{label_name}</span><br>"
+                        f"<span style='color:#555; font-size:0.85rem;'>Code: {label_code}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
 
-                fig3, ax3 = plt.subplots(figsize=(6, 3))
-                bar_colors = [SEVERITY_COLORS.get(c, "#aaa") for c in proba_df["Code"]]
-                ax3.barh(proba_df["Label"], proba_df["Probability"], color=bar_colors)
-                ax3.set_xlim(0, 1)
-                ax3.set_xlabel("Probability")
-                plt.tight_layout()
-                st.pyplot(fig3)
-                plt.close()
+                with col_scores:
+                    if "probabilities" in result:
+                        st.markdown("**Confidence scores**")
+                        proba = result["probabilities"]
+                        proba_df = pd.DataFrame([
+                            {
+                                "Severity": LABEL_NAMES.get(k, k),
+                                "Confidence": v,
+                            }
+                            for k, v in sorted(proba.items(), key=lambda x: -x[1])
+                        ])
+                        fig, ax = plt.subplots(figsize=(5, 2.5))
+                        bars = ax.barh(
+                            proba_df["Severity"],
+                            proba_df["Confidence"],
+                            color=[
+                                SEVERITY_COLORS.get(
+                                    [k for k, v in LABEL_NAMES.items() if v == row][0], "#888"
+                                )
+                                for row in proba_df["Severity"]
+                            ],
+                        )
+                        ax.set_xlim(0, 1)
+                        ax.set_xlabel("Confidence")
+                        ax.invert_yaxis()
+                        for bar, val in zip(bars, proba_df["Confidence"]):
+                            ax.text(
+                                bar.get_width() + 0.01,
+                                bar.get_y() + bar.get_height() / 2,
+                                f"{val:.3f}",
+                                va="center",
+                                fontsize=9,
+                            )
+                        ax.grid(axis="x", alpha=0.3)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close()
+                    elif "decision_scores" in result:
+                        st.markdown("**Decision scores** (LinearSVC — not probabilities)")
+                        for k, v in sorted(
+                            result["decision_scores"].items(), key=lambda x: -x[1]
+                        ):
+                            st.write(f"{LABEL_NAMES.get(k, k)}: `{v:.4f}`")
 
-            elif "decision_scores" in result:
-                st.markdown("**Decision Scores (SVM)**")
-                scores_df = pd.DataFrame(
-                    result["decision_scores"].items(), columns=["Code", "Score"]
-                ).sort_values("Score", ascending=False)
-                scores_df["Label"] = scores_df["Code"].map(LABEL_NAMES)
-                st.dataframe(scores_df, hide_index=True)
+                # Show cleaned text for transparency
+                with st.expander("Cleaned text (what the model actually sees)"):
+                    st.code(cleaned)
 
-# ══════════════════════════════════════════════
-# TAB 3 — Data Explorer
-# ══════════════════════════════════════════════
-with tab_explore:
-    st.subheader("Explore MAUDE Records")
 
-    if "df_train" in st.session_state:
-        df_view = st.session_state["df_train"]
-    else:
-        # Try to load accumulated dataset
-        acc = load_accumulated()
-        if not acc.empty:
-            df_view = acc
-        else:
-            st.info("Train the model or run ingestion to populate the Data Explorer.")
-            df_view = None
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — ABOUT THE MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_about:
+    st.subheader("About this model")
 
-    if df_view is not None:
-        st.markdown(f"**{len(df_view):,} records loaded**")
-        col1, col2 = st.columns(2)
-        with col1:
-            severity_filter = st.multiselect(
-                "Filter by Severity Code",
-                options=list(df_view["severity_label"].unique()),
-                default=list(df_view["severity_label"].unique()),
-            )
-        with col2:
-            search_term = st.text_input("Search narrative text",
-                                         placeholder="e.g. burn, pump, implant")
+    col_l, col_r = st.columns(2)
 
-        filtered = df_view[df_view["severity_label"].isin(severity_filter)]
-        if search_term:
-            text_col = "clean_text" if "clean_text" in filtered.columns else "narrative_text"
-            filtered = filtered[
-                filtered[text_col].str.contains(search_term, case=False, na=False)
-            ]
-
-        st.markdown(f"Showing **{len(filtered):,}** records")
-        display_cols = ["report_number", "date_received", "severity_label", "device_name",
-                         "clean_text" if "clean_text" in filtered.columns else "narrative_text"]
-        st.dataframe(filtered[display_cols], height=400, hide_index=True)
-
-        st.download_button(
-            "⬇️ Download Filtered Records (CSV)",
-            data=filtered.to_csv(index=False),
-            file_name="maude_filtered.csv",
-            mime="text/csv",
+    with col_l:
+        st.markdown("#### What it does")
+        st.markdown(
+            "Classifies free-text narrative descriptions from FDA MAUDE "
+            "(Manufacturer and User Facility Device Experience) adverse event "
+            "reports into four severity categories:\n\n"
+            "- **D — Death**: patient death reported in connection with device use\n"
+            "- **I — Injury**: serious or non-serious patient injury\n"
+            "- **M — Malfunction**: device failed to meet specifications; no patient harm\n"
+            "- **O — Other**: reports not fitting the above categories\n\n"
+            "MAUDE is the FDA database I worked with for 9 years during post-market "
+            "surveillance and complaint analytics at TCS. "
+            "Manual severity triage of these reports is time-consuming and "
+            "inconsistent across analysts — this classifier automates the first-pass "
+            "categorisation."
         )
 
-# ══════════════════════════════════════════════
-# TAB 4 — Pipeline Dashboard
-# ══════════════════════════════════════════════
-with tab_pipeline:
-    st.subheader("🔄 Incremental Pipeline Dashboard")
-    st.markdown(
-        "The incremental pipeline fetches batches of new records from the openFDA API, "
-        "deduplicates them against the accumulated dataset, and retrains the model only "
-        "when the new model beats the current champion's F1 score."
-    )
+        st.markdown("#### Why it matters")
+        st.markdown(
+            "FDA receives hundreds of thousands of MDR submissions annually. "
+            "Pharmacovigilance teams prioritise investigation queues by severity — "
+            "Death and Injury reports must be escalated within 30 days under "
+            "21 CFR Part 803. A classifier that reliably separates Death/Injury "
+            "from Malfunction/Other reduces analyst review time and improves "
+            "signal detection response time."
+        )
 
-    # ── Dataset stats ──────────────────────────────────────────────────────
-    col_a, col_b, col_c = st.columns(3)
+    with col_r:
+        st.markdown("#### Model approach")
+        st.markdown(
+            "**Algorithm:** TF-IDF vectorisation + Logistic Regression\n\n"
+            "**Why TF-IDF + LR as baseline:**\n"
+            "Interpretable, fast to train, and well-suited for bag-of-words "
+            "classification on short clinical texts. Logistic Regression with "
+            "`class_weight='balanced'` explicitly handles the class imbalance "
+            "in MAUDE data — Death events are under 10% of records.\n\n"
+            "**Key preprocessing steps:**\n"
+            "- Medical abbreviation expansion (pt → patient, dx → diagnosis)\n"
+            "- MAUDE boilerplate removal ('it was reported that…')\n"
+            "- Bigram features to capture clinical phrases\n"
+            "- Log-normalised TF (sublinear_tf) to compress high-frequency terms\n\n"
+            "**Evaluation:**\n"
+            "5-fold StratifiedKFold cross-validation — ensures each fold has "
+            "proportional class representation, giving a stable F1 estimate "
+            "even on smaller datasets where a single train/test split can "
+            "vary by ±0.10 F1."
+        )
 
-    acc_df = load_accumulated()
-    col_a.metric("Accumulated Records", f"{len(acc_df):,}" if not acc_df.empty else "0")
+    st.divider()
+
+    # Live metrics from champion_metrics.json
+    st.markdown("#### Current model metrics")
 
     if os.path.exists(CHAMPION_METRICS_PATH):
         with open(CHAMPION_METRICS_PATH) as f:
             champ = json.load(f)
-        col_b.metric("Champion F1", f"{champ.get('f1_weighted', 0):.4f}")
-        col_c.metric("Champion trained on", f"{champ.get('training_records', '?')} records")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("CV F1 (5-fold, weighted)", f"{champ.get('cv_f1_mean', 0):.3f}")
+        m2.metric("CV F1 std", f"±{champ.get('cv_f1_std', 0):.3f}")
+        m3.metric("Hold-out accuracy", f"{champ.get('accuracy', 0):.3f}")
+        m4.metric("Training records", f"{champ.get('training_records', '?'):,}")
     else:
-        col_b.metric("Champion F1", "—")
-        col_c.metric("Champion trained on", "—")
+        st.info("No trained model yet — run `python -m src.model.train --records 5000`")
 
     st.divider()
 
-    # ── Manual ingestion trigger ───────────────────────────────────────────
-    st.markdown("**Run Incremental Ingestion Now**")
-    batch_size = st.number_input("Batch size (records to fetch)", 500, 50_000, 5000, 500)
-    run_retrain = st.checkbox("Retrain after ingestion", value=True)
-
-    if st.button("▶️ Run Ingestion Cycle", use_container_width=True):
-        with st.spinner(f"Fetching {batch_size:,} records and deduplicating..."):
-            summary = run_ingestion(
-                batch_size=int(batch_size),
-                api_key=api_key or None,
-                retrain=run_retrain,
-                cross_validate=run_cv,
-                model_type=model_type,
-            )
-
-        st.success(
-            f"✅ Ingestion complete! "
-            f"**{summary['new_records_added']:,}** new records added · "
-            f"**{summary['total_accumulated']:,}** total accumulated · "
-            f"Retrain: {'✅' if summary['retrain_triggered'] else '⏭️ skipped (no new data)'}"
-        )
+    # Class imbalance explanation
+    st.markdown("#### The class imbalance challenge")
+    st.markdown(
+        "MAUDE data reflects the real-world distribution of device adverse events: "
+        "most reports are Malfunction, followed by Injury, with Death under 10%. "
+        "A naive classifier optimising for accuracy would predict Malfunction for "
+        "ambiguous cases and score well overall — but fail on the clinically critical "
+        "Death and Injury classes.\n\n"
+        "This was identified empirically via confusion matrix analysis: Death cases "
+        "were systematically misclassified as Injury. The fix was `class_weight='balanced'` "
+        "on the Logistic Regression, which penalises misclassification of rare classes "
+        "proportionally to their inverse frequency in the training data."
+    )
 
     st.divider()
 
-    # ── MLflow run history ────────────────────────────────────────────────
-    st.markdown("**MLflow Run History**")
-
-    try:
-        import mlflow
-        mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "mlruns"))
-        client = mlflow.tracking.MlflowClient()
-
-        experiment = client.get_experiment_by_name("maude-nlp-severity")
-        if experiment:
-            runs = client.search_runs(
-                experiment_ids=[experiment.experiment_id],
-                order_by=["start_time DESC"],
-                max_results=20,
-            )
-            if runs:
-                run_rows = []
-                for r in runs:
-                    # CV F1 must stay a pure float column (None for missing runs).
-                    # Using a string sentinel like "—" creates a mixed-type column
-                    # that PyArrow cannot serialize to Arrow format.
-                    cv_raw = r.data.metrics.get("cv_f1_mean")
-                    cv_f1_val = round(cv_raw, 4) if cv_raw is not None else None
-
-                    run_rows.append({
-                        "Run ID":       r.info.run_id[:8],
-                        "Started":      pd.to_datetime(r.info.start_time, unit="ms").strftime("%Y-%m-%d %H:%M"),
-                        "F1 (hold-out)": round(r.data.metrics.get("f1_weighted", 0), 4),
-                        "CV F1 (mean)": cv_f1_val,
-                        "Accuracy":     round(r.data.metrics.get("accuracy", 0), 4),
-                        "Dummy F1":     round(r.data.metrics.get("dummy_f1_weighted", 0), 4),
-                        "Model":        r.data.params.get("model_type", ""),
-                        "Records":      int(r.data.params.get("records_fetched", 0) or 0),
-                        "Promoted":     r.data.tags.get("promoted", ""),
-                        "Reason":       r.data.tags.get("promotion_reason", ""),
-                    })
-                runs_df = pd.DataFrame(run_rows)
-                # "CV F1 (mean)" is float64 with possible NaN — fully Arrow-compatible
-                runs_df["CV F1 (mean)"] = runs_df["CV F1 (mean)"].astype("float64")
-                st.dataframe(runs_df, hide_index=True)
-
-                # F1 trend chart
-                st.markdown("**F1 Score Trend Across Runs**")
-                fig_trend, ax_trend = plt.subplots(figsize=(8, 3))
-                # Reverse so oldest run is run #1, newest is last
-                f1_vals    = runs_df["F1 (hold-out)"].tolist()[::-1]
-                cv_f1_vals = runs_df["CV F1 (mean)"].tolist()[::-1]
-                x = range(1, len(f1_vals) + 1)
-                ax_trend.plot(x, f1_vals, marker="o", color="#1f77b4",
-                              linewidth=2, label="Hold-out F1")
-                # Only plot CV F1 line where values are not NaN
-                cv_x = [i for i, v in zip(x, cv_f1_vals) if v == v]  # NaN != NaN
-                cv_y = [v for v in cv_f1_vals if v == v]
-                if cv_x:
-                    ax_trend.plot(cv_x, cv_y, marker="s", color="#2ca02c",
-                                  linewidth=2, linestyle="--", label="CV F1 (5-fold)")
-                ax_trend.axhline(
-                    runs_df["Dummy F1"].iloc[0],
-                    linestyle=":", color="#d62728", alpha=0.7, label="Dummy baseline"
-                )
-                ax_trend.set_xlabel("Run #")
-                ax_trend.set_ylabel("Weighted F1")
-                ax_trend.legend()
-                plt.tight_layout()
-                st.pyplot(fig_trend)
-                plt.close()
-            else:
-                st.info("No MLflow runs yet. Train the model to create the first run.")
-        else:
-            st.info("No MLflow experiment found yet. Train the model first.")
-    except Exception as e:
-        st.warning(f"MLflow not available or no runs logged yet: {e}")
+    st.markdown("#### Data source")
+    st.markdown(
+        "Records are fetched from the "
+        "[openFDA MAUDE API](https://open.fda.gov/apis/device/event/) "
+        "using paginated requests. The API is free and requires no authentication "
+        "for the public rate limit. Training uses the `event_type` field as the "
+        "classification label and `mdr_text` narrative fields as input text.\n\n"
+        "The openFDA API caps pagination at 25,000 records per query. "
+        "To collect larger datasets, the ingestion client partitions queries "
+        "into yearly date-range windows, resetting the offset for each year."
+    )
 
     st.divider()
-    st.markdown("**Run Scheduled Pipeline from CLI**")
-    st.code(
-        "# Run once\n"
-        "python -m src.ingestion.incremental --batch 10000\n\n"
-        "# Run continuously (daily at 2 AM UTC)\n"
-        "python -m src.ingestion.incremental --schedule --cron '0 2 * * *' --batch 10000\n\n"
-        "# Run with cross-validation on retrain\n"
-        "python -m src.ingestion.incremental --batch 10000 --cross-validate",
-        language="bash",
+
+    st.markdown("#### Roadmap")
+    st.markdown(
+        "**v1 (current):** TF-IDF + Logistic Regression baseline, "
+        "StratifiedKFold evaluation, MLflow experiment tracking\n\n"
+        "**v2 (planned):** Fine-tune `emilyalsentzer/Bio_ClinicalBERT` "
+        "on the same dataset to measure F1 uplift on the Death class — "
+        "the primary motivation being that TF-IDF cannot capture semantic "
+        "similarity between clinical phrases ('cardiac arrest' vs 'heart stopped')"
+    )
+
+    st.divider()
+    st.caption(
+        "Built by Mukund Padmanabha · ISB AMPBA 2025 · "
+        "9 years FDA & EU MDR regulatory experience · "
+        "[GitHub](https://github.com/makymaverick/maude-nlp-classifier)"
     )
