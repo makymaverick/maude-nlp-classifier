@@ -1,0 +1,26 @@
+{
+  "cv_f1_mean": 0.8484287008615841,
+  "cv_f1_std": 0.0012262231157583823,
+  "cv_f1_macro_mean": 0.7379217633953135,
+  "cv_f1_macro_std": 0.003214932505973807,
+  "per_class": {
+    "f1_D_mean": 0.7701021221582125,
+    "f1_D_std": 0.01111272283281937,
+    "f1_I_mean": 0.8473559441331122,
+    "f1_I_std": 0.0017664053957991515,
+    "f1_M_mean": 0.8928802723104798,
+    "f1_M_std": 0.0015417822437859634,
+    "f1_O_mean": 0.4413487149794486,
+    "f1_O_std": 0.00468509831020854,
+    "f1_macro_mean": 0.7379217633953135,
+    "f1_macro_std": 0.003214932505973807,
+    "f1_weighted_mean": 0.8484287008615841,
+    "f1_weighted_std": 0.0012262231157583823
+  },
+  "training_records": 161752,
+  "model_type": "hardened_tfidf_lr",
+  "enrich": true,
+  "drop_unknown": false,
+  "cv_splits_path": "data/cv_splits.json",
+  "mlflow_run_id": "f125085b8106449ab14b03dc24e2d5b5"
+}
