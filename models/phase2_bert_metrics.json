@@ -1,0 +1,112 @@
+{
+  "phase": "phase2-bioclinbert",
+  "config": {
+    "PRETRAINED_MODEL": "emilyalsentzer/Bio_ClinicalBERT",
+    "MAX_LENGTH": 512,
+    "POOLING": "cls_mean_concat",
+    "DROPOUT": 0.1,
+    "EPOCHS": 3,
+    "BATCH_SIZE": 16,
+    "GRAD_ACCUM": 2,
+    "LR": 2e-05,
+    "WEIGHT_DECAY": 0.01,
+    "WARMUP_RATIO": 0.1,
+    "USE_FP16": true,
+    "MAX_GRAD_NORM": 1.0,
+    "EARLY_STOP_PATIENCE": 1,
+    "USE_CLASS_WEIGHTS": true,
+    "USE_FOCAL_LOSS": false,
+    "TEXT_COL": "narrative_text",
+    "LABEL_COL": "severity_label",
+    "DROP_UNKNOWN": true,
+    "NUM_WORKERS": 2,
+    "USE_LENGTH_BUCKETING": true,
+    "N_FOLDS_TO_RUN": 5,
+    "SEED": 42,
+    "PHASE1_CV_F1_WEIGHTED": 0.8484,
+    "PHASE1_CV_F1_MACRO": 0.7379,
+    "PHASE1_DEATH_F1": 0.7701,
+    "PROMOTION_GATE_F1": 0.853,
+    "DATA_PATH": "/kaggle/input/datasets/mukundpadmanabha/maude-phase-2/maude_raw.csv",
+    "SPLITS_PATH": "/kaggle/input/datasets/mukundpadmanabha/maude-phase-2/cv_splits.json"
+  },
+  "aggregated": {
+    "f1_D_mean": 0.8317941140414753,
+    "f1_D_std": 0.007600728998210046,
+    "f1_I_mean": 0.872806403609248,
+    "f1_I_std": 0.0014951344488510995,
+    "f1_M_mean": 0.9068545337763496,
+    "f1_M_std": 0.0015888551360821149,
+    "f1_O_mean": 0.4794160125201343,
+    "f1_O_std": 0.006940130660103985,
+    "f1_macro_mean": 0.7727177659868016,
+    "f1_macro_std": 0.002018425044873047,
+    "f1_weighted_mean": 0.8690825254730884,
+    "f1_weighted_std": 0.0010251147067941088,
+    "n_folds": 5
+  },
+  "per_fold": [
+    {
+      "f1_D": 0.8345712356515868,
+      "f1_I": 0.8712671509281679,
+      "f1_M": 0.9048396190024035,
+      "f1_O": 0.4729957805907173,
+      "f1_macro": 0.7709184465432188,
+      "f1_weighted": 0.8671097045667554,
+      "fold": 1,
+      "best_epoch": 3,
+      "checkpoint_path": "/kaggle/working/checkpoints/fold1_best.pt"
+    },
+    {
+      "f1_D": 0.836436170212766,
+      "f1_I": 0.8711187075245188,
+      "f1_M": 0.9091551576901558,
+      "f1_O": 0.4826403771967424,
+      "f1_macro": 0.7748376031560457,
+      "f1_weighted": 0.8699716135195438,
+      "fold": 2,
+      "best_epoch": 3,
+      "checkpoint_path": "/kaggle/working/checkpoints/fold2_best.pt"
+    },
+    {
+      "f1_D": 0.8418194161575017,
+      "f1_I": 0.8749238825965169,
+      "f1_M": 0.9056202352106849,
+      "f1_O": 0.4764309764309764,
+      "f1_macro": 0.77469862759892,
+      "f1_weighted": 0.8692646510278084,
+      "fold": 3,
+      "best_epoch": 3,
+      "checkpoint_path": "/kaggle/working/checkpoints/fold3_best.pt"
+    },
+    {
+      "f1_D": 0.8249336870026526,
+      "f1_I": 0.8727052652814202,
+      "f1_M": 0.9081338587308122,
+      "f1_O": 0.47352874346739376,
+      "f1_macro": 0.7698253886205697,
+      "f1_weighted": 0.8692762461200306,
+      "fold": 4,
+      "best_epoch": 3,
+      "checkpoint_path": "/kaggle/working/checkpoints/fold4_best.pt"
+    },
+    {
+      "f1_D": 0.8212100611828688,
+      "f1_I": 0.8740170117156155,
+      "f1_M": 0.9065237982476912,
+      "f1_O": 0.49148418491484186,
+      "f1_macro": 0.7733087640152544,
+      "f1_weighted": 0.869790412131304,
+      "fold": 5,
+      "best_epoch": 3,
+      "checkpoint_path": "/kaggle/working/checkpoints/fold5_best.pt"
+    }
+  ],
+  "phase1_reference": {
+    "cv_f1_weighted": 0.8484,
+    "cv_f1_macro": 0.7379,
+    "death_f1": 0.7701
+  },
+  "delta_vs_phase1_weighted": 0.020682525473088353,
+  "delta_vs_phase1_death": 0.06169411404147529
+}
